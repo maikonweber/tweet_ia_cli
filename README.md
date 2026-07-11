@@ -101,11 +101,29 @@ A sessão fica em `.auth/` na pasta do projeto (não versionar). Se expirar, rod
 | `post <texto>` | Publica no X (opcional: revisar antes com `--mode` / `--prompt`) |
 | `ai-post <tema>` | Gera com IA e publica (`--yes` pula a confirmação) |
 
-Ajuda:
+### Atalhos
 
 ```powershell
-npm run tweet -- --help
+tweet p "texto"           # post
+tweet p "texto" -r        # post + revisão
+tweet p "texto" -e        # post + inglês
+tweet p "texto" -r -e     # post + revisado em inglês
+tweet p "texto" -r -e -y  # publica sem perguntar
+tweet g "tema"            # generate
+tweet t "texto" -s        # transform + ortografia
 ```
+
+| Atalho | Significado |
+|--------|-------------|
+| `p` | `post` |
+| `g` | `generate` |
+| `t` | `transform` |
+| `a` | `ai-post` |
+| `-r` | revisão (`revise`) |
+| `-e` | inglês (`english`) |
+| `-r -e` | revisado em inglês |
+| `-s` | ortografia (`spelling`) |
+| `-y` | `--yes` |
 
 ---
 
@@ -198,7 +216,28 @@ Playwright (sessão .auth/) → x.com → Postar
 
 ---
 
-## Limites (conta Free do X)
+## Modelos OpenRouter (custo)
+
+O CLI tenta **gratuito primeiro** e cai para o **pago mais barato**:
+
+| Ordem | Modelo | Custo (prompt / completion por 1M tokens) |
+|------|--------|---------------------------------------------|
+| 1 | `openrouter/free` | **$0** (router free) |
+| 2 | `meta-llama/llama-3.2-3b-instruct:free` | **$0** |
+| 3 | `openai/gpt-oss-20b:free` | **$0** |
+| 4 | `meta-llama/llama-3.3-70b-instruct:free` | **$0** |
+| 5 | `inclusionai/ling-2.6-flash` | **$0.01 / $0.03** |
+| 6 | `meta-llama/llama-3.1-8b-instruct` | **$0.02 / $0.03** |
+| 7 | `mistralai/mistral-nemo` | **$0.02 / $0.03** |
+
+Referência: `openai/gpt-4o-mini` custa **$0.15 / $0.60** (~20× mais caro que o fallback pago).
+
+Free no OpenRouter: limite diário baixo (sem créditos ≈ 50 req/dia). Se o free falhar (429/503), o CLI usa o pago barato.
+
+```env
+OPENROUTER_VERBOSE=true          # mostra qual modelo respondeu
+OPENROUTER_SKIP_FREE=true        # pula free e vai direto ao pago barato
+```
 
 Na geração e na publicação o CLI respeita o **Free**:
 

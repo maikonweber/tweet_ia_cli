@@ -125,34 +125,37 @@ function assertLoggedIn(page) {
 
 export async function loginX() {
   ensureAuthDir();
-  const browser = await launchBrowser();
-  const context = await newContext(browser, false);
-  const page = await context.newPage();
-
-  console.log("Abrindo x.com — faça login na sua conta (até 5 minutos).");
-  await gotoWithRetry(page, "https://x.com/i/flow/login");
-
+  let browser;
+  let context;
   try {
-    await waitForLogin(page);
-  } catch {
-    await browser.close();
-    throw new Error("Tempo esgotado. Faça login e rode de novo: npm run tweet -- login");
+    browser = await launchBrowser();
+    context = await newContext(browser, false);
+    const page = await context.newPage();
+
+    console.log("Abrindo x.com — faça login na sua conta (até 5 minutos).");
+    await gotoWithRetry(page, "https://x.com/i/flow/login");
+
+    try {
+      await waitForLogin(page);
+    } catch {
+      throw new Error("Tempo esgotado. Faça login e rode de novo: tweet login");
+    }
+
+    await gotoWithRetry(page, "https://x.com/home");
+    await waitForLogin(page, 60_000);
+
+    const username = await readUsername(page);
+    await context.storageState({ path: SESSION_PATH });
+    writeFileSync(
+      META_PATH,
+      JSON.stringify({ username, savedAt: new Date().toISOString() }, null, 2),
+    );
+
+    console.log(username ? `Sessão salva (@${username}).` : "Sessão salva.");
+    return { username };
+  } finally {
+    await closeBrowser(browser, context);
   }
-
-  // Garante que a home carregou com cookies estáveis
-  await gotoWithRetry(page, "https://x.com/home");
-  await waitForLogin(page, 60_000);
-
-  const username = await readUsername(page);
-  await context.storageState({ path: SESSION_PATH });
-  writeFileSync(
-    META_PATH,
-    JSON.stringify({ username, savedAt: new Date().toISOString() }, null, 2),
-  );
-
-  await browser.close();
-  console.log(username ? `Sessão salva (@${username}).` : "Sessão salva.");
-  return { username };
 }
 
 async function openComposer(page) {
@@ -258,36 +261,53 @@ async function clickPost(page) {
   }
 }
 
+async function closeBrowser(browser, context) {
+  try {
+    if (context) await context.close().catch(() => {});
+  } finally {
+    if (browser) {
+      await browser.close().catch(() => {});
+      // Garante que processos filhos do Chrome não fiquem zumbis no Windows
+      try {
+        browser.process()?.kill?.();
+      } catch {
+        // ignore
+      }
+    }
+  }
+}
+
 export async function postTweet(text) {
   if (!text || !text.trim()) {
     throw new Error("Texto do tweet vazio.");
   }
   assertWithinFreeLimit(text.trim());
   if (!hasSession()) {
-    throw new Error('Sem sessão. Rode antes: npm run tweet -- login');
+    throw new Error("Sem sessão. Rode antes: tweet login");
   }
 
-  const browser = await launchBrowser();
-  const context = await newContext(browser, true);
-  const page = await context.newPage();
-
+  let browser;
+  let context;
   try {
+    browser = await launchBrowser();
+    context = await newContext(browser, true);
+    const page = await context.newPage();
+
     // Home é mais estável que /compose/post (evita ERR_CONNECTION_ABORTED)
     await gotoWithRetry(page, "https://x.com/home");
     assertLoggedIn(page);
 
-    // Confirma UI logada
     await page
       .locator(SELECTORS.accountSwitcher)
       .waitFor({ state: "visible", timeout: 45_000 })
       .catch(() => {
-        throw new Error("Sessão inválida ou página não carregou. Rode: npm run tweet -- login");
+        throw new Error("Sessão inválida ou página não carregou. Rode: tweet login");
       });
 
     await openComposer(page);
     await fillComposer(page, text.trim());
     await clickPost(page);
-    await sleep(4000);
+    await sleep(2500);
 
     await context.storageState({ path: SESSION_PATH });
 
@@ -297,7 +317,7 @@ export async function postTweet(text) {
       text: text.trim(),
     };
   } finally {
-    await browser.close();
+    await closeBrowser(browser, context);
   }
 }
 

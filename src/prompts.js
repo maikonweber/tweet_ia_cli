@@ -95,9 +95,20 @@ export function buildUserPrompt({ topic, tone, lang, style = DEFAULT_STYLE }) {
   ].join("\n");
 }
 
-export function buildTransformMessages({ text, mode, prompt, style = DEFAULT_STYLE }) {
+export function buildTransformMessages({ text, mode, modes, prompt, style = DEFAULT_STYLE }) {
+  const resolvedList =
+    Array.isArray(modes) && modes.length
+      ? modes
+      : mode
+        ? [mode]
+        : [];
+
   const parts = [];
-  if (mode?.transformInstruction) parts.push(mode.transformInstruction);
+  if (resolvedList.length > 1) {
+    parts.push(buildCombinedTransformInstruction(resolvedList));
+  } else if (resolvedList[0]?.transformInstruction) {
+    parts.push(resolvedList[0].transformInstruction);
+  }
   if (prompt) parts.push(prompt);
   if (!parts.length) {
     parts.push(
@@ -133,4 +144,39 @@ export function buildShortenMessages(text, currentLen, style = DEFAULT_STYLE) {
       text,
     ].join("\n"),
   };
+}
+
+/** Combina modos curtos (-r -e) em uma instrução só. */
+export function buildCombinedTransformInstruction(modes) {
+  const ids = modes.map((m) => m.id);
+  if (ids.includes("revise") && ids.includes("english")) {
+    return [
+      "Revise o texto (clareza e gramática) e reescreva em inglês natural (US).",
+      'Resultado: "revisado em inglês".',
+      `Máximo ${X_FREE_LIMITS.maxChars} caracteres.`,
+      "Devolva somente o texto final.",
+    ].join(" ");
+  }
+  if (ids.includes("spelling") && ids.includes("english")) {
+    return [
+      "Corrija ortografia se necessário e reescreva em inglês natural (US).",
+      `Máximo ${X_FREE_LIMITS.maxChars} caracteres.`,
+      "Devolva somente o texto final.",
+    ].join(" ");
+  }
+  return modes.map((m) => m.transformInstruction).join(" ");
+}
+
+export function resolveModes(modeNames = []) {
+  const unique = [];
+  const seen = new Set();
+  for (const name of modeNames) {
+    if (!name) continue;
+    const mode = resolveMode(name);
+    if (!seen.has(mode.id)) {
+      seen.add(mode.id);
+      unique.push(mode);
+    }
+  }
+  return unique;
 }

@@ -5,6 +5,20 @@ import { generateTweet, transformTweet } from "../src/openrouter.js";
 import { PROMPT_MODES } from "../src/prompts.js";
 import { clearSession, hasSession, loginX, postTweet, whoami } from "../src/twitter.js";
 
+const COMMAND_ALIASES = {
+  p: "post",
+  g: "generate",
+  t: "transform",
+  a: "ai-post",
+  post: "post",
+  generate: "generate",
+  transform: "transform",
+  "ai-post": "ai-post",
+  login: "login",
+  logout: "logout",
+  whoami: "whoami",
+};
+
 function usage() {
   const modes = Object.values(PROMPT_MODES)
     .map((m) => `    ${m.id.padEnd(10)} ${m.label} (aliases: ${m.aliases.join(", ")})`)
@@ -13,40 +27,47 @@ function usage() {
   console.log(`
 tweet-ia-cli — gera com OpenRouter e publica no X via navegador (Playwright)
 
-Uso (PowerShell) — em qualquer pasta, após npm run link:global:
+Atalhos:
+  tweet p "texto"              # post
+  tweet p "texto" -r           # post + revisão
+  tweet p "texto" -e           # post + inglês
+  tweet p "texto" -r -e        # post + revisado em inglês
+  tweet g "tema"               # generate
+  tweet t "texto" -s           # transform + ortografia
+
+Uso:
   tweet login
-  tweet generate "tema"
+  tweet p "Casamento Sangrento é bom demais" -r -e
   tweet generate "tema" --mode english
-  tweet generate "tema" --hashtags --emojis
-  tweet generate "tema" --prompt "tom sarcástico"
-  tweet transform "texto" --mode spelling
-  tweet post "texto"
-  tweet ai-post "tema" --yes
   tweet logout
 
 Comandos:
-  login                 Abre o navegador; você entra no X e a sessão é salva
-  logout                Apaga a sessão local
-  whoami                Mostra se há sessão salva
-  generate <tema>       Gera tweet com IA e pergunta se deseja publicar
-  transform <texto>     Aplica modo/prompt em um texto existente (não publica)
-  post <texto>          Publica no X (opcional: --mode / --prompt antes)
-  ai-post <tema>        Gera com IA e publica
+  p | post <texto>          Publica (com -r/-e/-s revisa antes)
+  g | generate <tema>       Gera e pergunta se publica
+  t | transform <texto>     Só transforma (não publica)
+  a | ai-post <tema>        Gera e publica
+  login / logout / whoami
 
-Opções:
-  --mode <modo>         Preset de prompt (veja lista abaixo)
-  --prompt <texto>      Injeta instrução extra (pode combinar com --mode)
-  --tone <tom>          Tom (padrão: direto e natural) — generate/ai-post
-  --lang <idioma>       Idioma base (padrão: pt-BR) — generate/ai-post
-  --hashtags            Permite até 2 hashtags (padrão: desligado)
-  --emojis              Permite até 2 emojis (padrão: desligado)
-  --yes, -y             Confirma publicação sem perguntar
-  -h, --help            Mostra esta ajuda
+Opções curtas:
+  -r                        Revisão de texto (--mode revise)
+  -e                        Inglês (--mode english)
+  -r -e                     Revisado em inglês (os dois)
+  -s                        Ortografia (--mode spelling)
+  -y, --yes                 Publica sem perguntar
+  -h, --help                Ajuda
 
-Modos (--mode):
+Opções longas:
+  --mode <modo>             english | spelling | revise
+  --prompt <texto>          Instrução extra
+  --tone <tom>              Tom (generate/ai-post)
+  --lang <idioma>           Idioma base (padrão: pt-BR)
+  --hashtags                Permite até 2 hashtags
+  --emojis                  Permite até 2 emojis
+
+Modos:
 ${modes}
 
-Por padrão: sem hashtags e sem emojis (conta Free / texto limpo).
+Por padrão: sem hashtags e sem emojis.
 `.trim());
 }
 
@@ -56,7 +77,7 @@ function parseArgs(argv) {
     tone: "direto e natural",
     lang: "pt-BR",
     yes: false,
-    mode: null,
+    modes: [],
     prompt: "",
     allowHashtags: false,
     allowEmojis: false,
@@ -69,6 +90,12 @@ function parseArgs(argv) {
       flags.help = true;
     } else if (arg === "--yes" || arg === "-y") {
       flags.yes = true;
+    } else if (arg === "-r") {
+      flags.modes.push("revise");
+    } else if (arg === "-e") {
+      flags.modes.push("english");
+    } else if (arg === "-s") {
+      flags.modes.push("spelling");
     } else if (arg === "--hashtags") {
       flags.allowHashtags = true;
     } else if (arg === "--emojis") {
@@ -78,9 +105,19 @@ function parseArgs(argv) {
     } else if (arg === "--lang") {
       flags.lang = args[++i];
     } else if (arg === "--mode") {
-      flags.mode = args[++i];
+      flags.modes.push(args[++i]);
     } else if (arg === "--prompt") {
       flags.prompt = args[++i];
+    } else if (arg.startsWith("-") && arg.length > 2 && !arg.startsWith("--")) {
+      // Ex.: -re → -r -e
+      for (const ch of arg.slice(1)) {
+        if (ch === "r") flags.modes.push("revise");
+        else if (ch === "e") flags.modes.push("english");
+        else if (ch === "s") flags.modes.push("spelling");
+        else if (ch === "y") flags.yes = true;
+        else if (ch === "h") flags.help = true;
+        else throw new Error(`Opção desconhecida: -${ch}`);
+      }
     } else if (arg.startsWith("--")) {
       throw new Error(`Opção desconhecida: ${arg}`);
     } else {
@@ -91,15 +128,18 @@ function parseArgs(argv) {
   if (flags.tone === undefined || flags.lang === undefined) {
     throw new Error("Valor ausente para --tone ou --lang");
   }
-  if (flags.mode === undefined) {
-    throw new Error("Informe o modo: --mode english|spelling|revise");
+  if (flags.modes.includes(undefined)) {
+    throw new Error("Informe o modo: --mode english|spelling|revise (ou -e -r -s)");
   }
   if (flags.prompt === undefined) {
     throw new Error('Informe o prompt: --prompt "sua instrução"');
   }
 
+  const rawCommand = positional[0];
+  const command = rawCommand ? COMMAND_ALIASES[rawCommand] || rawCommand : undefined;
+
   return {
-    command: positional[0],
+    command,
     rest: positional.slice(1).join(" ").trim(),
     flags,
   };
@@ -113,15 +153,27 @@ function styleFromFlags(flags) {
   };
 }
 
+function hasModesOrPrompt(flags) {
+  return Boolean(flags.modes?.length || flags.prompt);
+}
+
 async function confirm(question) {
   process.stdout.write(`${question} [s/N] `);
-  return await new Promise((resolve) => {
+  const answer = await new Promise((resolve) => {
+    const onData = (data) => {
+      cleanup();
+      resolve(String(data).trim().toLowerCase());
+    };
+    const cleanup = () => {
+      process.stdin.off("data", onData);
+      if (process.stdin.isTTY) process.stdin.setRawMode?.(false);
+      process.stdin.pause();
+    };
+    process.stdin.resume();
     process.stdin.setEncoding("utf8");
-    process.stdin.once("data", (data) => {
-      const answer = String(data).trim().toLowerCase();
-      resolve(answer === "s" || answer === "sim" || answer === "y" || answer === "yes");
-    });
+    process.stdin.once("data", onData);
   });
+  return answer === "s" || answer === "sim" || answer === "y" || answer === "yes";
 }
 
 function printText(text, label = null) {
@@ -131,10 +183,10 @@ function printText(text, label = null) {
 }
 
 async function maybeTransform(openrouter, text, flags) {
-  if (!flags.mode && !flags.prompt) return text;
+  if (!hasModesOrPrompt(flags)) return text;
   return transformTweet(openrouter, {
     text,
-    mode: flags.mode,
+    modes: flags.modes,
     prompt: flags.prompt,
     style: styleFromFlags(flags),
   });
@@ -171,13 +223,13 @@ async function main() {
   }
 
   if (command === "generate") {
-    if (!rest) throw new Error('Informe o tema: tweet generate "seu tema"');
+    if (!rest) throw new Error('Informe o tema: tweet g "seu tema"');
     const { openrouter } = loadOpenRouterOnly();
     const text = await generateTweet(openrouter, {
       topic: rest,
       tone: flags.tone,
       lang: flags.lang,
-      mode: flags.mode,
+      modes: flags.modes,
       prompt: flags.prompt,
       style,
     });
@@ -202,15 +254,15 @@ async function main() {
 
   if (command === "transform") {
     if (!rest) {
-      throw new Error('Informe o texto: tweet transform "texto" --mode spelling');
+      throw new Error('Informe o texto: tweet t "texto" -r');
     }
-    if (!flags.mode && !flags.prompt) {
-      throw new Error("Use --mode english|spelling|revise e/ou --prompt \"...\"");
+    if (!hasModesOrPrompt(flags)) {
+      throw new Error("Use -r / -e / -s / --mode e/ou --prompt \"...\"");
     }
     const { openrouter } = loadOpenRouterOnly();
     const text = await transformTweet(openrouter, {
       text: rest,
-      mode: flags.mode,
+      modes: flags.modes,
       prompt: flags.prompt,
       style,
     });
@@ -219,10 +271,10 @@ async function main() {
   }
 
   if (command === "post") {
-    if (!rest) throw new Error('Informe o texto: tweet post "seu tweet"');
+    if (!rest) throw new Error('Informe o texto: tweet p "seu tweet"');
     const { openrouter } = loadOpenRouterOnly();
     let text = rest;
-    if (flags.mode || flags.prompt) {
+    if (hasModesOrPrompt(flags)) {
       text = await maybeTransform(openrouter, rest, flags);
       printText(text, "Prévia");
       if (!flags.yes) {
@@ -240,13 +292,13 @@ async function main() {
   }
 
   if (command === "ai-post") {
-    if (!rest) throw new Error('Informe o tema: tweet ai-post "seu tema"');
+    if (!rest) throw new Error('Informe o tema: tweet a "seu tema"');
     const config = loadConfig();
     const text = await generateTweet(config.openrouter, {
       topic: rest,
       tone: flags.tone,
       lang: flags.lang,
-      mode: flags.mode,
+      modes: flags.modes,
       prompt: flags.prompt,
       style,
     });
@@ -266,10 +318,14 @@ async function main() {
     return;
   }
 
-  throw new Error(`Comando desconhecido: ${command}`);
+  throw new Error(`Comando desconhecido: ${command}. Use tweet --help`);
 }
 
-main().catch((err) => {
-  console.error(`Erro: ${err.message}`);
-  process.exit(1);
-});
+main()
+  .then(() => {
+    process.exit(0);
+  })
+  .catch((err) => {
+    console.error(`Erro: ${err.message}`);
+    process.exit(1);
+  });
