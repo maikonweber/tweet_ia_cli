@@ -10,9 +10,10 @@ const META_PATH = resolve(AUTH_DIR, "x-meta.json");
 
 const SELECTORS = {
   composer: '[data-testid="tweetTextarea_0"]',
-  postButton: '[data-testid="tweetButtonInline"], [data-testid="tweetButton"]',
   accountSwitcher: '[data-testid="SideNav_AccountSwitcher_Button"]',
   sideNavPost: '[data-testid="SideNav_NewTweet_Button"]',
+  mask: '[data-testid="mask"]',
+  dialog: '[role="dialog"]',
 };
 
 function ensureAuthDir() {
@@ -43,7 +44,6 @@ function sleep(ms) {
 
 async function launchBrowser() {
   const { headless } = loadBrowserConfig();
-  // Prefere Chrome instalado no Windows (menos bloqueio que Chromium puro)
   try {
     return await chromium.launch({
       headless,
@@ -119,8 +119,180 @@ async function readUsername(page) {
 function assertLoggedIn(page) {
   const url = page.url();
   if (url.includes("/login") || url.includes("/i/flow/login")) {
-    throw new Error("Sessão expirada. Rode: npm run tweet -- login");
+    throw new Error("Sessão expirada. Rode: tweet login");
   }
+}
+
+async function closeBrowser(browser, context) {
+  try {
+    if (context) await context.close().catch(() => {});
+  } finally {
+    if (browser) {
+      await browser.close().catch(() => {});
+      try {
+        browser.process()?.kill?.();
+      } catch {
+        // ignore
+      }
+    }
+  }
+}
+
+/**
+ * Preferir composer do modal — o da home fica atrás do mask e quebra no headless.
+ */
+function composerLocator(page) {
+  return page
+    .locator(`${SELECTORS.dialog} ${SELECTORS.composer}`)
+    .or(page.locator(SELECTORS.composer))
+    .last();
+}
+
+function postButtonLocator(page) {
+  return page
+    .locator(`${SELECTORS.dialog} [data-testid="tweetButton"]`)
+    .or(page.locator('[data-testid="tweetButton"]'))
+    .or(page.locator('[data-testid="tweetButtonInline"]'))
+    .or(page.getByRole("button", { name: /^(Postar|Post|Tweetar|Tweet)$/i }))
+    .last();
+}
+
+/** Fecha dialogs extras; se o compose já abriu, mantém. */
+async function dismissBlockingLayers(page) {
+  for (let i = 0; i < 3; i++) {
+    const dialogComposer = page.locator(`${SELECTORS.dialog} ${SELECTORS.composer}`);
+    if (await dialogComposer.isVisible().catch(() => false)) return;
+
+    const maskVisible = await page.locator(SELECTORS.mask).first().isVisible().catch(() => false);
+    if (!maskVisible) break;
+
+    await page.keyboard.press("Escape").catch(() => {});
+    await sleep(300);
+  }
+
+  // Mask órfão ainda interceptando clique (headless)
+  await page
+    .evaluate(() => {
+      for (const el of document.querySelectorAll('[data-testid="mask"]')) {
+        const dialog = document.querySelector('[role="dialog"]');
+        const dialogOpen = dialog && dialog.querySelector('[data-testid="tweetTextarea_0"]');
+        if (dialogOpen) {
+          el.style.pointerEvents = "none";
+        } else {
+          el.style.display = "none";
+          el.style.pointerEvents = "none";
+        }
+      }
+    })
+    .catch(() => {});
+}
+
+async function focusComposer(page) {
+  const box = composerLocator(page);
+  await box.waitFor({ state: "visible", timeout: 30_000 });
+  await dismissBlockingLayers(page);
+
+  try {
+    await box.click({ delay: 40, timeout: 5_000 });
+  } catch {
+    await box.evaluate((el) => {
+      el.focus();
+      try {
+        el.click();
+      } catch {
+        // ignore
+      }
+    });
+  }
+  await sleep(250);
+}
+
+async function openComposer(page) {
+  await dismissBlockingLayers(page);
+
+  if (await page.locator(`${SELECTORS.dialog} ${SELECTORS.composer}`).isVisible().catch(() => false)) {
+    return;
+  }
+
+  const sideNav = page.locator(SELECTORS.sideNavPost);
+  if (await sideNav.isVisible().catch(() => false)) {
+    try {
+      await sideNav.click({ timeout: 8_000 });
+    } catch {
+      await sideNav.click({ force: true });
+    }
+    await composerLocator(page).waitFor({ state: "visible", timeout: 20_000 });
+    await dismissBlockingLayers(page);
+    return;
+  }
+
+  await page.keyboard.press("n");
+  try {
+    await composerLocator(page).waitFor({ state: "visible", timeout: 10_000 });
+    await dismissBlockingLayers(page);
+    return;
+  } catch {
+    // continua
+  }
+
+  await gotoWithRetry(page, "https://x.com/compose/post");
+  await composerLocator(page).waitFor({ state: "visible", timeout: 20_000 });
+  await dismissBlockingLayers(page);
+}
+
+async function fillComposer(page, text) {
+  await focusComposer(page);
+
+  await page.keyboard.press("Control+A");
+  await page.keyboard.press("Backspace");
+  await sleep(150);
+
+  const inserted = await page.evaluate((value) => {
+    const dialog = document.querySelector('[role="dialog"]');
+    const el =
+      (dialog && dialog.querySelector('[data-testid="tweetTextarea_0"]')) ||
+      [...document.querySelectorAll('[data-testid="tweetTextarea_0"]')].at(-1) ||
+      document.querySelector('[role="textbox"][contenteditable="true"]');
+    if (!el) return false;
+    el.focus();
+    const ok = document.execCommand("insertText", false, value);
+    el.dispatchEvent(new InputEvent("input", { bubbles: true, data: value, inputType: "insertText" }));
+    return ok || (el.innerText || "").includes(value.slice(0, Math.min(12, value.length)));
+  }, text);
+
+  if (!inserted) {
+    await page.keyboard.type(text, { delay: 12 });
+  }
+
+  await sleep(400);
+}
+
+async function clickPost(page) {
+  const btn = postButtonLocator(page);
+  await btn.waitFor({ state: "visible", timeout: 30_000 });
+
+  for (let i = 0; i < 20; i++) {
+    const enabled = await btn
+      .evaluate((el) => {
+        const node = el.closest("button") || el;
+        return !node.disabled && node.getAttribute("aria-disabled") !== "true";
+      })
+      .catch(() => false);
+    if (enabled) break;
+    await sleep(250);
+  }
+
+  await dismissBlockingLayers(page);
+
+  try {
+    await btn.click({ timeout: 8_000 });
+  } catch {
+    await btn.click({ force: true, timeout: 8_000 });
+  }
+
+  await sleep(500);
+  await page.keyboard.press("Control+Enter").catch(() => {});
+  await sleep(1000);
 }
 
 export async function loginX() {
@@ -158,125 +330,6 @@ export async function loginX() {
   }
 }
 
-async function openComposer(page) {
-  // 1) Composer já na home
-  if (await page.locator(SELECTORS.composer).first().isVisible().catch(() => false)) {
-    return;
-  }
-
-  // 2) Botão "Postar" da sidebar
-  const sideNav = page.locator(SELECTORS.sideNavPost);
-  if (await sideNav.isVisible().catch(() => false)) {
-    await sideNav.click();
-    await page.locator(SELECTORS.composer).first().waitFor({ state: "visible", timeout: 20_000 });
-    return;
-  }
-
-  // 3) Atalho "n" do X
-  await page.keyboard.press("n");
-  try {
-    await page.locator(SELECTORS.composer).first().waitFor({ state: "visible", timeout: 10_000 });
-    return;
-  } catch {
-    // continua
-  }
-
-  // 4) Último recurso: URL de compose
-  await gotoWithRetry(page, "https://x.com/compose/post");
-  await page.locator(SELECTORS.composer).first().waitFor({ state: "visible", timeout: 20_000 });
-}
-
-async function fillComposer(page, text) {
-  const box = page.locator(SELECTORS.composer).first();
-  await box.waitFor({ state: "visible", timeout: 30_000 });
-  await box.click({ delay: 50 });
-  await sleep(400);
-
-  // Limpa conteúdo anterior
-  await page.keyboard.press("Control+A");
-  await page.keyboard.press("Backspace");
-  await sleep(200);
-
-  // Draft.js do X responde melhor a insertText do que só type()
-  const inserted = await page.evaluate((value) => {
-    const el =
-      document.querySelector('[data-testid="tweetTextarea_0"]') ||
-      document.querySelector('[role="textbox"][contenteditable="true"]');
-    if (!el) return false;
-    el.focus();
-    const ok = document.execCommand("insertText", false, value);
-    el.dispatchEvent(new InputEvent("input", { bubbles: true, data: value, inputType: "insertText" }));
-    return ok || (el.innerText || "").includes(value.slice(0, Math.min(12, value.length)));
-  }, text);
-
-  if (!inserted) {
-    await page.keyboard.type(text, { delay: 20 });
-  }
-
-  await sleep(500);
-}
-
-function postButtonLocator(page) {
-  // Preferência: botão do modal de compose; depois o inline da home
-  return page
-    .locator('[data-testid="tweetButton"]:not([disabled])')
-    .or(page.locator('[data-testid="tweetButtonInline"]:not([disabled])'))
-    .or(page.getByRole("button", { name: /^(Postar|Post|Tweetar|Tweet)$/i }))
-    .first();
-}
-
-async function clickPost(page) {
-  const btn = postButtonLocator(page);
-
-  // Espera o botão ficar clicável (Draft.js demora a habilitar)
-  await btn.waitFor({ state: "visible", timeout: 30_000 });
-
-  for (let i = 0; i < 20; i++) {
-    const enabled = await btn.evaluate((el) => {
-      const node = el.closest("button") || el;
-      const aria = node.getAttribute("aria-disabled");
-      return !node.disabled && aria !== "true";
-    }).catch(() => false);
-
-    if (enabled) break;
-    await sleep(250);
-  }
-
-  // Garante foco no composer e tenta clique normal + fallback
-  await page.locator(SELECTORS.composer).first().click({ timeout: 5_000 }).catch(() => {});
-  await sleep(200);
-
-  try {
-    await btn.click({ timeout: 10_000 });
-  } catch {
-    await btn.click({ force: true, timeout: 10_000 });
-  }
-
-  // Se ainda não enviou, tenta Ctrl+Enter (atalho do X)
-  await sleep(800);
-  const stillOpen = await page.locator(SELECTORS.composer).first().isVisible().catch(() => false);
-  if (stillOpen) {
-    await page.locator(SELECTORS.composer).first().click().catch(() => {});
-    await page.keyboard.press("Control+Enter");
-  }
-}
-
-async function closeBrowser(browser, context) {
-  try {
-    if (context) await context.close().catch(() => {});
-  } finally {
-    if (browser) {
-      await browser.close().catch(() => {});
-      // Garante que processos filhos do Chrome não fiquem zumbis no Windows
-      try {
-        browser.process()?.kill?.();
-      } catch {
-        // ignore
-      }
-    }
-  }
-}
-
 export async function postTweet(text) {
   if (!text || !text.trim()) {
     throw new Error("Texto do tweet vazio.");
@@ -293,7 +346,6 @@ export async function postTweet(text) {
     context = await newContext(browser, true);
     const page = await context.newPage();
 
-    // Home é mais estável que /compose/post (evita ERR_CONNECTION_ABORTED)
     await gotoWithRetry(page, "https://x.com/home");
     assertLoggedIn(page);
 
@@ -304,10 +356,11 @@ export async function postTweet(text) {
         throw new Error("Sessão inválida ou página não carregou. Rode: tweet login");
       });
 
+    await dismissBlockingLayers(page);
     await openComposer(page);
     await fillComposer(page, text.trim());
     await clickPost(page);
-    await sleep(2500);
+    await sleep(2000);
 
     await context.storageState({ path: SESSION_PATH });
 

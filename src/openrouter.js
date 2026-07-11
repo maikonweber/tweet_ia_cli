@@ -13,9 +13,52 @@ import {
   tweetLength,
   X_FREE_LIMITS,
 } from "./limits.js";
+import {
+  estimateCostUsd,
+  formatPriceRow,
+  formatUsd,
+  getModelPrice,
+} from "./pricing.js";
 
 function isRetryableStatus(status) {
   return [402, 408, 429, 502, 503, 504].includes(status);
+}
+
+function emptyUsage() {
+  return { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+}
+
+function readUsage(data) {
+  return {
+    promptTokens: Number(data?.usage?.prompt_tokens || 0),
+    completionTokens: Number(data?.usage?.completion_tokens || 0),
+    totalTokens: Number(data?.usage?.total_tokens || 0),
+  };
+}
+
+function addUsage(a, b) {
+  return {
+    promptTokens: a.promptTokens + b.promptTokens,
+    completionTokens: a.completionTokens + b.completionTokens,
+    totalTokens: a.totalTokens + b.totalTokens,
+  };
+}
+
+async function buildCostMeta(openrouter, modelUsed, usage) {
+  const price = await getModelPrice(modelUsed, openrouter.baseUrl);
+  const costUsd = estimateCostUsd({
+    promptTokens: usage.promptTokens,
+    completionTokens: usage.completionTokens,
+    price,
+  });
+  return {
+    model: modelUsed,
+    usage,
+    price,
+    costUsd,
+    priceLabel: formatPriceRow(price.matched || modelUsed, price),
+    costLabel: formatUsd(costUsd),
+  };
 }
 
 async function chatCompletionOnce(openrouter, model, { system, user, temperature }) {
@@ -61,24 +104,27 @@ async function chatCompletionOnce(openrouter, model, { system, user, temperature
     throw err;
   }
 
+  const modelUsed = data?.model || model;
+  const usage = readUsage(data);
+  const cost = await buildCostMeta(openrouter, modelUsed, usage);
+
   return {
     text: text.replace(/^["']|["']$/g, "").trim(),
-    modelUsed: data?.model || model,
+    modelUsed,
+    usage,
+    cost,
   };
 }
 
-/**
- * Tenta free → free → ... → pago barato.
- * Também envia `models` (fallback nativo OpenRouter) na 1ª tentativa.
- */
 async function chatCompletion(openrouter, { system, user, temperature = 0.7 }) {
   const cascade = openrouter.models?.length
     ? openrouter.models
     : ["openrouter/free", "inclusionai/ling-2.6-flash"];
 
   let lastError;
+  const attempts = [];
 
-  // 1) Uma chamada com lista nativa de fallbacks (OpenRouter escolhe o próximo)
+  // 1) Fallback nativo OpenRouter
   try {
     const response = await fetch(`${openrouter.baseUrl}/chat/completions`, {
       method: "POST",
@@ -112,56 +158,84 @@ async function chatCompletion(openrouter, { system, user, temperature = 0.7 }) {
       const text = data?.choices?.[0]?.message?.content?.trim();
       if (text) {
         const modelUsed = data?.model || cascade[0];
-        if (process.env.OPENROUTER_VERBOSE === "true") {
-          console.error(`Modelo: ${modelUsed}`);
-        }
-        return text.replace(/^["']|["']$/g, "").trim();
+        const usage = readUsage(data);
+        const cost = await buildCostMeta(openrouter, modelUsed, usage);
+        attempts.push({ model: modelUsed, ok: true, costUsd: cost.costUsd });
+        return {
+          text: text.replace(/^["']|["']$/g, "").trim(),
+          modelUsed,
+          usage,
+          cost,
+          attempts,
+        };
       }
     }
 
     lastError = new Error(`OpenRouter ${response.status}: ${bodyText.slice(0, 400)}`);
     lastError.retryable = isRetryableStatus(response.status);
+    attempts.push({ model: "cascade", ok: false, error: lastError.message.slice(0, 80) });
   } catch (err) {
     lastError = err;
   }
 
-  // 2) Fallback manual modelo a modelo
+  // 2) Manual
   for (const model of cascade) {
     try {
-      const { text, modelUsed } = await chatCompletionOnce(openrouter, model, {
+      const result = await chatCompletionOnce(openrouter, model, {
         system,
         user,
         temperature,
       });
-      console.error(`Modelo usado: ${modelUsed}`);
-      return text;
+      attempts.push({
+        model: result.modelUsed,
+        ok: true,
+        costUsd: result.cost.costUsd,
+        priceLabel: result.cost.priceLabel,
+      });
+      return { ...result, attempts };
     } catch (err) {
       lastError = err;
-      const hint = err.retryable ? "tentando próximo" : "falhou";
-      console.error(`Aviso: ${model} (${hint}) — ${err.message.slice(0, 120)}`);
-      if (!err.retryable && err.status && err.status < 500 && err.status !== 402 && err.status !== 429) {
-        // erro de auth/validação: não adianta continuar todos
-        if (err.status === 401) throw err;
-      }
+      attempts.push({ model, ok: false, error: err.message.slice(0, 100) });
+      console.error(`Aviso: ${model} (tentando próximo) — ${err.message.slice(0, 120)}`);
+      if (err.status === 401) throw err;
     }
   }
 
   throw lastError || new Error("Nenhum modelo OpenRouter disponível.");
 }
 
-async function enforceFreeLimit(openrouter, text, style = DEFAULT_STYLE) {
+function mergeMeta(base, extraUsage, extraCost) {
+  if (!base) return extraCost;
+  const usage = addUsage(base.usage || emptyUsage(), extraUsage || emptyUsage());
+  const costUsd =
+    (base.costUsd || 0) + (extraCost?.costUsd != null ? extraCost.costUsd : 0);
+  return {
+    ...extraCost,
+    model: extraCost?.model || base.model,
+    usage,
+    costUsd,
+    costLabel: formatUsd(costUsd),
+    priceLabel: extraCost?.priceLabel || base.priceLabel,
+    attempts: [...(base.attempts || []), ...(extraCost?.attempts || [])],
+  };
+}
+
+async function enforceFreeLimit(openrouter, text, style = DEFAULT_STYLE, meta = null) {
   let current = applyStyleGuards(text, style);
   let len = tweetLength(current);
+  let costMeta = meta;
 
   for (let attempt = 1; attempt <= 2 && len > X_FREE_LIMITS.maxChars; attempt++) {
     console.error(
-      `Aviso: ${len}/${X_FREE_LIMITS.maxChars} caracteres — encurtando para o limite Free do X (tentativa ${attempt})...`,
+      `Aviso: ${len}/${X_FREE_LIMITS.maxChars} caracteres — encurtando (tentativa ${attempt})...`,
     );
     const { system, user } = buildShortenMessages(current, len, style);
-    current = applyStyleGuards(
-      await chatCompletion(openrouter, { system, user, temperature: 0.3 }),
-      style,
-    );
+    const result = await chatCompletion(openrouter, { system, user, temperature: 0.3 });
+    current = applyStyleGuards(result.text, style);
+    costMeta = mergeMeta(costMeta, result.usage, {
+      ...result.cost,
+      attempts: result.attempts,
+    });
     len = tweetLength(current);
   }
 
@@ -172,13 +246,18 @@ async function enforceFreeLimit(openrouter, text, style = DEFAULT_STYLE) {
     if (lastSpace > X_FREE_LIMITS.maxChars * 0.6) {
       cut = cut.slice(0, lastSpace).trim();
     }
-    console.error(
-      `Aviso: corte local para ${tweetLength(cut)}/${X_FREE_LIMITS.maxChars} caracteres.`,
-    );
+    console.error(`Aviso: corte local para ${tweetLength(cut)}/${X_FREE_LIMITS.maxChars}.`);
     current = cut;
   }
 
-  return assertWithinFreeLimit(current);
+  return {
+    text: assertWithinFreeLimit(current),
+    meta: costMeta,
+  };
+}
+
+function toResult(text, meta) {
+  return { text, meta };
 }
 
 export async function generateTweet(
@@ -215,8 +294,13 @@ export async function generateTweet(
     style,
   });
   const user = buildUserPrompt({ topic, tone, lang: effectiveLang, style });
-  const draft = await chatCompletion(openrouter, { system, user, temperature: 0.7 });
-  return enforceFreeLimit(openrouter, draft, style);
+  const result = await chatCompletion(openrouter, { system, user, temperature: 0.7 });
+  const enforced = await enforceFreeLimit(openrouter, result.text, style, {
+    ...result.cost,
+    attempts: result.attempts,
+    usage: result.usage,
+  });
+  return toResult(enforced.text, enforced.meta);
 }
 
 export async function transformTweet(
@@ -239,6 +323,11 @@ export async function transformTweet(
     prompt,
     style,
   });
-  const draft = await chatCompletion(openrouter, { system, user, temperature: 0.35 });
-  return enforceFreeLimit(openrouter, draft, style);
+  const result = await chatCompletion(openrouter, { system, user, temperature: 0.35 });
+  const enforced = await enforceFreeLimit(openrouter, result.text, style, {
+    ...result.cost,
+    attempts: result.attempts,
+    usage: result.usage,
+  });
+  return toResult(enforced.text, enforced.meta);
 }

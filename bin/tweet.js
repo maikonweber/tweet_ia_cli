@@ -2,6 +2,7 @@
 import { loadConfig, loadOpenRouterOnly } from "../src/config.js";
 import { DEFAULT_STYLE } from "../src/limits.js";
 import { generateTweet, transformTweet } from "../src/openrouter.js";
+import { cascadePriceTable, formatUsd } from "../src/pricing.js";
 import { PROMPT_MODES } from "../src/prompts.js";
 import { clearSession, hasSession, loginX, postTweet, whoami } from "../src/twitter.js";
 
@@ -10,6 +11,9 @@ const COMMAND_ALIASES = {
   g: "generate",
   t: "transform",
   a: "ai-post",
+  c: "costs",
+  costs: "costs",
+  cost: "costs",
   post: "post",
   generate: "generate",
   transform: "transform",
@@ -34,6 +38,7 @@ Atalhos:
   tweet p "texto" -r -e        # post + revisado em inglês
   tweet g "tema"               # generate
   tweet t "texto" -s           # transform + ortografia
+  tweet costs                  # tabela de preços da cascata
 
 Uso:
   tweet login
@@ -46,6 +51,7 @@ Comandos:
   g | generate <tema>       Gera e pergunta se publica
   t | transform <texto>     Só transforma (não publica)
   a | ai-post <tema>        Gera e publica
+  c | costs                 Lista custo por modelo (cascata)
   login / logout / whoami
 
 Opções curtas:
@@ -182,8 +188,35 @@ function printText(text, label = null) {
   console.log(`\n(${[...text].length}/280 caracteres — limite Free do X)`);
 }
 
+function printCost(meta) {
+  if (!meta) return;
+  const u = meta.usage || {};
+  console.log("\n--- Custo OpenRouter ---");
+  console.log(`Modelo: ${meta.model || "n/d"}`);
+  if (meta.priceLabel) console.log(`Preço:  ${meta.priceLabel}`);
+  console.log(
+    `Tokens: ${u.promptTokens || 0} in + ${u.completionTokens || 0} out = ${u.totalTokens || (u.promptTokens || 0) + (u.completionTokens || 0)}`,
+  );
+  console.log(`Custo desta chamada: ${meta.costLabel || formatUsd(meta.costUsd)}`);
+}
+
+function printCostsTable() {
+  console.log("Cascata padrão — USD por 1M tokens (prompt / completion):\n");
+  for (const row of cascadePriceTable()) {
+    if (row.tier === "free" || (row.prompt === 0 && row.completion === 0)) {
+      console.log(`  FREE  ${row.id.padEnd(42)} $0 / $0`);
+    } else {
+      console.log(
+        `  PAID  ${row.id.padEnd(42)} $${row.prompt} / $${row.completion}`,
+      );
+    }
+  }
+  console.log("\nFluxo: tenta FREE → se 429/falha → PAID mais barato.");
+  console.log("Após cada generate/transform/post -r, o custo real da chamada é exibido.");
+}
+
 async function maybeTransform(openrouter, text, flags) {
-  if (!hasModesOrPrompt(flags)) return text;
+  if (!hasModesOrPrompt(flags)) return { text, meta: null };
   return transformTweet(openrouter, {
     text,
     modes: flags.modes,
@@ -222,10 +255,15 @@ async function main() {
     return;
   }
 
+  if (command === "costs") {
+    printCostsTable();
+    return;
+  }
+
   if (command === "generate") {
     if (!rest) throw new Error('Informe o tema: tweet g "seu tema"');
     const { openrouter } = loadOpenRouterOnly();
-    const text = await generateTweet(openrouter, {
+    const { text, meta } = await generateTweet(openrouter, {
       topic: rest,
       tone: flags.tone,
       lang: flags.lang,
@@ -234,6 +272,7 @@ async function main() {
       style,
     });
     printText(text, "Prévia");
+    printCost(meta);
 
     if (flags.yes) {
       const published = await postTweet(text);
@@ -260,13 +299,14 @@ async function main() {
       throw new Error("Use -r / -e / -s / --mode e/ou --prompt \"...\"");
     }
     const { openrouter } = loadOpenRouterOnly();
-    const text = await transformTweet(openrouter, {
+    const { text, meta } = await transformTweet(openrouter, {
       text: rest,
       modes: flags.modes,
       prompt: flags.prompt,
       style,
     });
     printText(text, "Transformado");
+    printCost(meta);
     return;
   }
 
@@ -275,8 +315,10 @@ async function main() {
     const { openrouter } = loadOpenRouterOnly();
     let text = rest;
     if (hasModesOrPrompt(flags)) {
-      text = await maybeTransform(openrouter, rest, flags);
+      const result = await maybeTransform(openrouter, rest, flags);
+      text = result.text;
       printText(text, "Prévia");
+      printCost(result.meta);
       if (!flags.yes) {
         const ok = await confirm("Publicar este texto?");
         if (!ok) {
@@ -294,7 +336,7 @@ async function main() {
   if (command === "ai-post") {
     if (!rest) throw new Error('Informe o tema: tweet a "seu tema"');
     const config = loadConfig();
-    const text = await generateTweet(config.openrouter, {
+    const { text, meta } = await generateTweet(config.openrouter, {
       topic: rest,
       tone: flags.tone,
       lang: flags.lang,
@@ -304,6 +346,7 @@ async function main() {
     });
 
     printText(text, "Prévia");
+    printCost(meta);
 
     if (!flags.yes) {
       const ok = await confirm("Publicar este tweet no navegador?");
