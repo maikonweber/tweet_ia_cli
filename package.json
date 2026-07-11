@@ -11,6 +11,8 @@
     "post": "node ./bin/tweet.js post",
     "generate": "node ./bin/tweet.js generate",
     "login": "node ./bin/tweet.js login",
+    "link:global": "npm link",
+    "unlink:global": "npm unlink -g tweet-ia-cli",
     "postinstall": "npx playwright install chromium"
   },
   "engines": {

@@ -46,22 +46,46 @@ OPENROUTER_MAX_TOKENS=280
 X_HEADLESS=false
 ```
 
+### Usar de qualquer pasta (`tweet` global)
+
+```powershell
+cd c:\Users\plugify\tweet_ia_cli
+npm run link:global
+```
+
+Depois, em **qualquer** terminal:
+
+```powershell
+tweet login
+tweet whoami
+tweet generate "tema"
+tweet post "texto"
+tweet --help
+```
+
+O `.env` e a sessão (`.auth/`) são sempre lidos da pasta do projeto, não do diretório atual.
+
+Para remover o comando global:
+
+```powershell
+npm run unlink:global
+```
+
 ---
 
 ## Primeiro uso
 
 ```powershell
-# 1) Login no X (abre o navegador — entre na conta e aguarde salvar a sessão)
+# Com comando global (após npm run link:global):
+tweet login
+tweet whoami
+tweet post "Olá do terminal"
+
+# Ou ainda pelo npm, dentro do projeto:
 npm run tweet -- login
-
-# 2) Confirmar sessão
-npm run tweet -- whoami
-
-# 3) Publicar
-npm run tweet -- post "Olá do terminal"
 ```
 
-A sessão fica em `.auth/` (não versionar). Se expirar, rode `login` de novo.
+A sessão fica em `.auth/` na pasta do projeto (não versionar). Se expirar, rode `login` de novo.
 
 ---
 
@@ -72,10 +96,10 @@ A sessão fica em `.auth/` (não versionar). Se expirar, rode `login` de novo.
 | `login` | Abre o navegador; você entra no X; sessão é salva |
 | `logout` | Apaga a sessão local |
 | `whoami` | Mostra se há sessão salva |
-| `generate <tema>` | Gera tweet com IA (não publica) |
+| `generate <tema>` | Gera tweet com IA e **pede permissão** para publicar |
 | `transform <texto>` | Aplica modo/prompt em texto existente (não publica) |
 | `post <texto>` | Publica no X (opcional: revisar antes com `--mode` / `--prompt`) |
-| `ai-post <tema>` | Gera com IA e publica |
+| `ai-post <tema>` | Gera com IA e publica (`--yes` pula a confirmação) |
 
 Ajuda:
 
@@ -174,7 +198,17 @@ Playwright (sessão .auth/) → x.com → Postar
 
 ---
 
-## Observações
+## Limites (conta Free do X)
+
+Na geração e na publicação o CLI respeita o **Free**:
+
+| Regra | Valor |
+|-------|--------|
+| Caracteres | máximo **280** |
+| Hashtags | **desligadas** por padrão (`--hashtags` para até 2) |
+| Emojis | **desligados** por padrão (`--emojis` para até 2) |
+
+Se a IA passar de 280, o CLI **encurta automaticamente** (até 2 tentativas) antes de exibir/publicar.
 
 - **OpenRouter** cuida só do texto; **Playwright** publica como usuário no site.
 - Mantenha `X_HEADLESS=false` no início para acompanhar o navegador.

@@ -1,4 +1,12 @@
-import "dotenv/config";
+import dotenv from "dotenv";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+/** Raiz do pacote (onde ficam .env e .auth), independente do cwd. */
+export const PROJECT_ROOT = resolve(__dirname, "..");
+
+dotenv.config({ path: resolve(PROJECT_ROOT, ".env") });
 
 function required(name) {
   const value = process.env[name]?.trim();

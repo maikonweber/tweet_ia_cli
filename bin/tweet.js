@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { loadConfig, loadOpenRouterOnly } from "../src/config.js";
+import { DEFAULT_STYLE } from "../src/limits.js";
 import { generateTweet, transformTweet } from "../src/openrouter.js";
 import { PROMPT_MODES } from "../src/prompts.js";
 import { clearSession, hasSession, loginX, postTweet, whoami } from "../src/twitter.js";
@@ -12,25 +13,22 @@ function usage() {
   console.log(`
 tweet-ia-cli — gera com OpenRouter e publica no X via navegador (Playwright)
 
-Uso (PowerShell):
-  npm run tweet -- login
-  npm run tweet -- generate "tema"
-  npm run tweet -- generate "tema" --mode english
-  npm run tweet -- generate "tema" --prompt "use tom sarcástico e 1 emoji"
-  npm run tweet -- transform "texto" --mode spelling
-  npm run tweet -- transform "texto" --mode revise
-  npm run tweet -- transform "texto" --mode english
-  npm run tweet -- transform "texto" --prompt "deixe mais curto"
-  npm run tweet -- post "texto"
-  npm run tweet -- post "texto" --mode revise
-  npm run tweet -- ai-post "tema" --mode english --yes
-  npm run tweet -- logout
+Uso (PowerShell) — em qualquer pasta, após npm run link:global:
+  tweet login
+  tweet generate "tema"
+  tweet generate "tema" --mode english
+  tweet generate "tema" --hashtags --emojis
+  tweet generate "tema" --prompt "tom sarcástico"
+  tweet transform "texto" --mode spelling
+  tweet post "texto"
+  tweet ai-post "tema" --yes
+  tweet logout
 
 Comandos:
   login                 Abre o navegador; você entra no X e a sessão é salva
   logout                Apaga a sessão local
   whoami                Mostra se há sessão salva
-  generate <tema>       Gera tweet com IA (não publica)
+  generate <tema>       Gera tweet com IA e pergunta se deseja publicar
   transform <texto>     Aplica modo/prompt em um texto existente (não publica)
   post <texto>          Publica no X (opcional: --mode / --prompt antes)
   ai-post <tema>        Gera com IA e publica
@@ -40,13 +38,15 @@ Opções:
   --prompt <texto>      Injeta instrução extra (pode combinar com --mode)
   --tone <tom>          Tom (padrão: direto e natural) — generate/ai-post
   --lang <idioma>       Idioma base (padrão: pt-BR) — generate/ai-post
+  --hashtags            Permite até 2 hashtags (padrão: desligado)
+  --emojis              Permite até 2 emojis (padrão: desligado)
   --yes, -y             Confirma publicação sem perguntar
   -h, --help            Mostra esta ajuda
 
 Modos (--mode):
 ${modes}
 
-Nota: automação de navegador pode quebrar se o X mudar o layout.
+Por padrão: sem hashtags e sem emojis (conta Free / texto limpo).
 `.trim());
 }
 
@@ -58,6 +58,8 @@ function parseArgs(argv) {
     yes: false,
     mode: null,
     prompt: "",
+    allowHashtags: false,
+    allowEmojis: false,
   };
   const positional = [];
 
@@ -67,6 +69,10 @@ function parseArgs(argv) {
       flags.help = true;
     } else if (arg === "--yes" || arg === "-y") {
       flags.yes = true;
+    } else if (arg === "--hashtags") {
+      flags.allowHashtags = true;
+    } else if (arg === "--emojis") {
+      flags.allowEmojis = true;
     } else if (arg === "--tone") {
       flags.tone = args[++i];
     } else if (arg === "--lang") {
@@ -99,6 +105,14 @@ function parseArgs(argv) {
   };
 }
 
+function styleFromFlags(flags) {
+  return {
+    ...DEFAULT_STYLE,
+    allowHashtags: Boolean(flags.allowHashtags),
+    allowEmojis: Boolean(flags.allowEmojis),
+  };
+}
+
 async function confirm(question) {
   process.stdout.write(`${question} [s/N] `);
   return await new Promise((resolve) => {
@@ -113,7 +127,7 @@ async function confirm(question) {
 function printText(text, label = null) {
   if (label) console.log(`\n--- ${label} ---`);
   console.log(text);
-  console.log(`\n(${[...text].length}/280 caracteres)`);
+  console.log(`\n(${[...text].length}/280 caracteres — limite Free do X)`);
 }
 
 async function maybeTransform(openrouter, text, flags) {
@@ -122,11 +136,13 @@ async function maybeTransform(openrouter, text, flags) {
     text,
     mode: flags.mode,
     prompt: flags.prompt,
+    style: styleFromFlags(flags),
   });
 }
 
 async function main() {
   const { command, rest, flags } = parseArgs(process.argv);
+  const style = styleFromFlags(flags);
 
   if (!command || flags.help) {
     usage();
@@ -146,7 +162,7 @@ async function main() {
 
   if (command === "whoami") {
     if (!hasSession()) {
-      console.log("Nenhuma sessão. Rode: npm run tweet -- login");
+      console.log("Nenhuma sessão. Rode: tweet login");
       return;
     }
     const me = await whoami();
@@ -155,7 +171,7 @@ async function main() {
   }
 
   if (command === "generate") {
-    if (!rest) throw new Error('Informe o tema: npm run tweet -- generate "seu tema"');
+    if (!rest) throw new Error('Informe o tema: tweet generate "seu tema"');
     const { openrouter } = loadOpenRouterOnly();
     const text = await generateTweet(openrouter, {
       topic: rest,
@@ -163,14 +179,30 @@ async function main() {
       lang: flags.lang,
       mode: flags.mode,
       prompt: flags.prompt,
+      style,
     });
-    printText(text);
+    printText(text, "Prévia");
+
+    if (flags.yes) {
+      const published = await postTweet(text);
+      console.log(`Publicado via navegador${published.username ? ` (@${published.username})` : ""}.`);
+      return;
+    }
+
+    const ok = await confirm("Publicar este tweet no X?");
+    if (!ok) {
+      console.log("Não publicado. Texto mantido acima.");
+      return;
+    }
+
+    const published = await postTweet(text);
+    console.log(`Publicado via navegador${published.username ? ` (@${published.username})` : ""}.`);
     return;
   }
 
   if (command === "transform") {
     if (!rest) {
-      throw new Error('Informe o texto: npm run tweet -- transform "texto" --mode spelling');
+      throw new Error('Informe o texto: tweet transform "texto" --mode spelling');
     }
     if (!flags.mode && !flags.prompt) {
       throw new Error("Use --mode english|spelling|revise e/ou --prompt \"...\"");
@@ -180,13 +212,14 @@ async function main() {
       text: rest,
       mode: flags.mode,
       prompt: flags.prompt,
+      style,
     });
     printText(text, "Transformado");
     return;
   }
 
   if (command === "post") {
-    if (!rest) throw new Error('Informe o texto: npm run tweet -- post "seu tweet"');
+    if (!rest) throw new Error('Informe o texto: tweet post "seu tweet"');
     const { openrouter } = loadOpenRouterOnly();
     let text = rest;
     if (flags.mode || flags.prompt) {
@@ -207,7 +240,7 @@ async function main() {
   }
 
   if (command === "ai-post") {
-    if (!rest) throw new Error('Informe o tema: npm run tweet -- ai-post "seu tema"');
+    if (!rest) throw new Error('Informe o tema: tweet ai-post "seu tema"');
     const config = loadConfig();
     const text = await generateTweet(config.openrouter, {
       topic: rest,
@@ -215,6 +248,7 @@ async function main() {
       lang: flags.lang,
       mode: flags.mode,
       prompt: flags.prompt,
+      style,
     });
 
     printText(text, "Prévia");

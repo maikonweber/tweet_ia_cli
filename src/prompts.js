@@ -1,3 +1,5 @@
+import { DEFAULT_STYLE, X_FREE_LIMITS } from "./limits.js";
+
 /** Presets de prompt para geração/transformação de tweets. */
 export const PROMPT_MODES = {
   english: {
@@ -8,9 +10,9 @@ export const PROMPT_MODES = {
       "Reescreva o resultado em inglês natural (US English).",
       "Mantenha o sentido e o tom; não traduza palavra por palavra.",
       "O texto final deve estar 100% em inglês.",
+      `Obrigatório: no máximo ${X_FREE_LIMITS.maxChars} caracteres.`,
     ].join(" "),
-    transformInstruction:
-      "Rewrite the following tweet in natural US English. Keep meaning and tone. Return only the final tweet text.",
+    transformInstruction: `Rewrite the following tweet in natural US English. Keep meaning and tone. Hard limit: ${X_FREE_LIMITS.maxChars} characters. Return only the final tweet text.`,
   },
   spelling: {
     id: "spelling",
@@ -19,20 +21,20 @@ export const PROMPT_MODES = {
     systemExtra: [
       "Faça revisão ortográfica rigorosa (acentos, grafia, concordância básica).",
       "Não mude o sentido nem o estilo; corrija apenas erros.",
+      `Não aumente o texto além de ${X_FREE_LIMITS.maxChars} caracteres.`,
     ].join(" "),
-    transformInstruction:
-      "Corrija apenas erros ortográficos e de acentuação do tweet abaixo. Não reescreva o estilo. Devolva somente o texto corrigido.",
+    transformInstruction: `Corrija apenas erros ortográficos e de acentuação do tweet abaixo. Não reescreva o estilo. Máximo ${X_FREE_LIMITS.maxChars} caracteres. Devolva somente o texto corrigido.`,
   },
   revise: {
     id: "revise",
     label: "Revisão de texto",
     aliases: ["revisao", "review", "revise", "texto"],
     systemExtra: [
-      "Faça revisão de texto: clareza, fluidez, gramática e concisão para X/Twitter.",
+      "Faça revisão de texto: clareza, fluidez, gramática e concisão para X/Twitter Free.",
       "Pode reescrever levemente, sem mudar a ideia central.",
+      `Obrigatório: no máximo ${X_FREE_LIMITS.maxChars} caracteres.`,
     ].join(" "),
-    transformInstruction:
-      "Revise o tweet abaixo para ficar mais claro, fluido e correto (gramática + estilo). Mantenha a ideia. Devolva somente o texto final.",
+    transformInstruction: `Revise o tweet abaixo para ficar mais claro, fluido e correto. Máximo ${X_FREE_LIMITS.maxChars} caracteres. Mantenha a ideia. Devolva somente o texto final.`,
   },
 };
 
@@ -48,15 +50,26 @@ export function resolveMode(name) {
   throw new Error(`Modo inválido: ${name}. Use: ${valid}`);
 }
 
-export function buildSystemPrompt({ tone, lang, mode, prompt }) {
+function styleRules(style = DEFAULT_STYLE) {
+  const hashtags = style.allowHashtags
+    ? `- Hashtags permitidas: no máximo ${X_FREE_LIMITS.maxHashtagsWhenEnabled}.`
+    : "- NÃO use hashtags (#). Zero hashtags.";
+  const emojis = style.allowEmojis
+    ? `- Emojis permitidos: no máximo ${X_FREE_LIMITS.maxEmojisWhenEnabled}.`
+    : "- NÃO use emojis. Zero emojis.";
+  return [hashtags, emojis];
+}
+
+export function buildSystemPrompt({ tone, lang, mode, prompt, style = DEFAULT_STYLE }) {
   const lines = [
-    "Você escreve tweets prontos para publicar no X/Twitter.",
-    "Regras:",
-    "- Máximo 280 caracteres.",
+    "Você escreve tweets prontos para publicar no X/Twitter (conta Free).",
+    "Regras OBRIGATÓRIAS (conta Free):",
+    `- No máximo ${X_FREE_LIMITS.maxChars} caracteres no texto final.`,
+    `- Prefira ficar entre 180 e ${X_FREE_LIMITS.maxChars} caracteres; se precisar, corte ideias secundárias.`,
+    ...styleRules(style),
     "- Sem aspas envolvendo o tweet inteiro.",
-    "- Sem hashtags em excesso (no máximo 2).",
-    "- Sem emojis em excesso.",
-    "- Não explique: devolva somente o texto do tweet.",
+    "- Sem threads, sem numeração 1/2, sem explicações.",
+    "- Não explique: devolva SOMENTE o texto do tweet.",
     `Tom padrão: ${tone}.`,
     `Idioma padrão: ${lang}.`,
   ];
@@ -71,25 +84,53 @@ export function buildSystemPrompt({ tone, lang, mode, prompt }) {
   return lines.join("\n");
 }
 
-export function buildUserPrompt({ topic, tone, lang }) {
-  return `Tema: ${topic}\nTom: ${tone}\nIdioma: ${lang}`;
+export function buildUserPrompt({ topic, tone, lang, style = DEFAULT_STYLE }) {
+  return [
+    `Tema: ${topic}`,
+    `Tom: ${tone}`,
+    `Idioma: ${lang}`,
+    `Limite rígido: ${X_FREE_LIMITS.maxChars} caracteres (X Free).`,
+    `Hashtags: ${style.allowHashtags ? `até ${X_FREE_LIMITS.maxHashtagsWhenEnabled}` : "proibidas"}`,
+    `Emojis: ${style.allowEmojis ? `até ${X_FREE_LIMITS.maxEmojisWhenEnabled}` : "proibidos"}`,
+  ].join("\n");
 }
 
-export function buildTransformMessages({ text, mode, prompt }) {
+export function buildTransformMessages({ text, mode, prompt, style = DEFAULT_STYLE }) {
   const parts = [];
   if (mode?.transformInstruction) parts.push(mode.transformInstruction);
   if (prompt) parts.push(prompt);
   if (!parts.length) {
-    parts.push("Melhore o tweet abaixo mantendo a ideia. Devolva somente o texto final (máx. 280 caracteres).");
+    parts.push(
+      `Melhore o tweet abaixo mantendo a ideia. Devolva somente o texto final (máx. ${X_FREE_LIMITS.maxChars} caracteres, conta Free do X).`,
+    );
   }
 
   return {
     system: [
-      "Você edita textos curtos para X/Twitter.",
-      "Máximo 280 caracteres.",
+      "Você edita textos curtos para X/Twitter (conta Free).",
+      `Limite rígido: ${X_FREE_LIMITS.maxChars} caracteres.`,
+      ...styleRules(style),
       "Não explique: devolva somente o texto final.",
       "Sem aspas envolvendo o texto inteiro.",
     ].join("\n"),
     user: `${parts.join("\n\n")}\n\nTexto:\n${text}`,
+  };
+}
+
+export function buildShortenMessages(text, currentLen, style = DEFAULT_STYLE) {
+  return {
+    system: [
+      "Você encurta tweets para caber no limite Free do X.",
+      `Limite rígido: ${X_FREE_LIMITS.maxChars} caracteres.`,
+      "Preserve a ideia principal.",
+      ...styleRules(style),
+      "Devolva SOMENTE o texto final, sem aspas e sem explicação.",
+    ].join("\n"),
+    user: [
+      `O texto tem ${currentLen} caracteres e precisa ter no máximo ${X_FREE_LIMITS.maxChars}.`,
+      "Encurte sem perder o sentido:",
+      "",
+      text,
+    ].join("\n"),
   };
 }
