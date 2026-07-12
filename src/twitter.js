@@ -157,12 +157,73 @@ function composerLocator(page) {
 }
 
 function postButtonLocator(page) {
-  return page
-    .locator(`${SELECTORS.dialog} [data-testid="tweetButton"]`)
-    .or(page.locator('[data-testid="tweetButton"]'))
-    .or(page.locator('[data-testid="tweetButtonInline"]'))
-    .or(page.getByRole("button", { name: /^(Postar|Post|Tweetar|Tweet)$/i }))
-    .first();
+  // Só o botão do modal. NÃO encadear tweetButtonInline (home, disabled) —
+  // o .or() faz o Playwright esperar o disabled até timeout.
+  return page.locator(`${SELECTORS.dialog} [data-testid="tweetButton"]`).first();
+}
+
+async function clickPost(page) {
+  await ensureComposerOpen(page);
+  await dismissBlockingLayers(page);
+
+  const btn = postButtonLocator(page);
+
+  // Espera o botão do modal ficar habilitado
+  let enabled = false;
+  for (let i = 0; i < 40; i++) {
+    const state = await btn
+      .evaluate((el) => {
+        const node = el.closest("button") || el;
+        const rect = node.getBoundingClientRect();
+        return {
+          disabled:
+            node.disabled ||
+            node.getAttribute("aria-disabled") === "true",
+          visible: rect.width > 0 && rect.height > 0,
+          text: (node.innerText || "").slice(0, 40),
+        };
+      })
+      .catch(() => null);
+
+    if (state && state.visible && !state.disabled) {
+      enabled = true;
+      break;
+    }
+    await sleep(250);
+  }
+
+  if (enabled) {
+    try {
+      await btn.click({ timeout: 5_000 });
+    } catch {
+      await btn.click({ force: true, timeout: 5_000 }).catch(() => {});
+    }
+  } else {
+    console.error("Aviso: botão Postar indisponível — enviando com Ctrl+Enter.");
+  }
+
+  await sleep(800);
+  const dialogStillOpen = await hasModalComposer(page);
+  if (dialogStillOpen) {
+    // Foca o editor e confirma (atalho nativo do X)
+    await contentEditableLocator(page).click({ force: true, timeout: 3_000 }).catch(() => {});
+    await page.keyboard.press("Control+Enter");
+    await sleep(1500);
+  }
+
+  // Se ainda aberto, última tentativa: clique force + Ctrl+Enter de novo
+  if (await hasModalComposer(page)) {
+    await btn.click({ force: true, timeout: 3_000 }).catch(() => {});
+    await page.keyboard.press("Control+Enter").catch(() => {});
+    await sleep(2000);
+  }
+
+  if (await hasModalComposer(page)) {
+    throw new Error(
+      "Não foi possível publicar: o composer ainda está aberto após Postar/Ctrl+Enter. " +
+        "Tente de novo com X_HEADLESS=false.",
+    );
+  }
 }
 
 function isComposeUrl(page) {
@@ -529,44 +590,6 @@ async function fillComposer(page, text) {
 
   console.error(`Composer OK via ${methodUsed}: ${finalLen}/${expectedLen} caracteres.`);
   await sleep(300);
-}
-
-async function clickPost(page) {
-  const btn = postButtonLocator(page);
-  await btn.waitFor({ state: "visible", timeout: 30_000 });
-
-  for (let i = 0; i < 24; i++) {
-    const enabled = await btn
-      .evaluate((el) => {
-        const node = el.closest("button") || el;
-        return !node.disabled && node.getAttribute("aria-disabled") !== "true";
-      })
-      .catch(() => false);
-    if (enabled) break;
-    await sleep(250);
-  }
-
-  await dismissBlockingLayers(page);
-  // Garante foco no composer cheio antes de enviar
-  await composerLocator(page).click({ force: true, timeout: 5_000 }).catch(() => {});
-  await sleep(200);
-
-  try {
-    await btn.click({ timeout: 8_000 });
-  } catch {
-    await btn.click({ force: true, timeout: 8_000 });
-  }
-
-  // Só Ctrl+Enter se o modal ainda estiver aberto (envio pode ter falhado)
-  await sleep(1200);
-  const dialogStillOpen = await page
-    .locator(`${SELECTORS.dialog} ${SELECTORS.composer}`)
-    .isVisible()
-    .catch(() => false);
-  if (dialogStillOpen) {
-    await page.keyboard.press("Control+Enter").catch(() => {});
-    await sleep(1500);
-  }
 }
 
 export async function loginX() {
