@@ -1,4 +1,10 @@
 #!/usr/bin/env node
+process.removeAllListeners?.("warning");
+process.on("warning", (w) => {
+  if (w?.name === "ExperimentalWarning" && /SQLite/i.test(String(w.message || ""))) return;
+  console.warn(w);
+});
+
 import { loadConfig, loadOpenRouterOnly } from "../src/config.js";
 import { getDbPath, getPost, getStats, listPosts, markPublished, savePost } from "../src/db.js";
 import { DEFAULT_STYLE, describeTier, getMaxChars, getXTier, tweetLength } from "../src/limits.js";

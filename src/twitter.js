@@ -146,13 +146,14 @@ async function closeBrowser(browser, context) {
 }
 
 /**
- * Preferir composer do modal — o da home fica atrás do mask e quebra no headless.
+ * Preferir composer do modal /compose/post — nunca o inline da home.
  */
+function modalComposerLocator(page) {
+  return page.locator(`${SELECTORS.dialog} ${SELECTORS.composer}`).first();
+}
+
 function composerLocator(page) {
-  return page
-    .locator(`${SELECTORS.dialog} ${SELECTORS.composer}`)
-    .or(page.locator(SELECTORS.composer))
-    .last();
+  return modalComposerLocator(page).or(page.locator(SELECTORS.composer).last());
 }
 
 function postButtonLocator(page) {
@@ -161,23 +162,31 @@ function postButtonLocator(page) {
     .or(page.locator('[data-testid="tweetButton"]'))
     .or(page.locator('[data-testid="tweetButtonInline"]'))
     .or(page.getByRole("button", { name: /^(Postar|Post|Tweetar|Tweet)$/i }))
-    .last();
+    .first();
 }
 
-/** Fecha dialogs extras; se o compose já abriu, mantém. */
+function isComposeUrl(page) {
+  return /\/compose\//i.test(page.url());
+}
+
+async function hasModalComposer(page) {
+  return modalComposerLocator(page).isVisible().catch(() => false);
+}
+
+/** Fecha overlays sem Escape (Escape fecha o compose e causa o crash). */
 async function dismissBlockingLayers(page) {
-  for (let i = 0; i < 3; i++) {
-    const dialogComposer = page.locator(`${SELECTORS.dialog} ${SELECTORS.composer}`);
-    if (await dialogComposer.isVisible().catch(() => false)) return;
-
-    const maskVisible = await page.locator(SELECTORS.mask).first().isVisible().catch(() => false);
-    if (!maskVisible) break;
-
-    await page.keyboard.press("Escape").catch(() => {});
-    await sleep(300);
+  // Se o compose já está aberto, só desativa o mask — nunca Escape.
+  if (await hasModalComposer(page) || isComposeUrl(page)) {
+    await page
+      .evaluate(() => {
+        for (const el of document.querySelectorAll('[data-testid="mask"]')) {
+          el.style.pointerEvents = "none";
+        }
+      })
+      .catch(() => {});
+    return;
   }
 
-  // Mask órfão ainda interceptando clique (headless)
   await page
     .evaluate(() => {
       for (const el of document.querySelectorAll('[data-testid="mask"]')) {
@@ -190,22 +199,32 @@ async function dismissBlockingLayers(page) {
           el.style.pointerEvents = "none";
         }
       }
+      // Cookie / consent banners comuns
+      for (const btn of document.querySelectorAll('[data-testid="sheetDialog"] [role="button"], [aria-label*="Close" i], [aria-label*="Fechar" i]')) {
+        const t = (btn.innerText || btn.getAttribute("aria-label") || "").toLowerCase();
+        if (/aceitar|accept|close|fechar|dismiss|got it/i.test(t)) {
+          try {
+            btn.click();
+          } catch {
+            // ignore
+          }
+        }
+      }
     })
     .catch(() => {});
 }
 
 function contentEditableLocator(page) {
-  // No X, data-testid="tweetTextarea_0" JÁ é o contenteditable (não um ancestral)
+  // Preferir SEMPRE o do dialog — .last() caía no composer da home
   return page
     .locator(`${SELECTORS.dialog} ${SELECTORS.composer}[contenteditable="true"]`)
     .or(page.locator(`${SELECTORS.dialog} ${SELECTORS.composer} [contenteditable="true"]`))
-    .or(page.locator(`${SELECTORS.composer}[contenteditable="true"]`))
-    .or(page.locator(`${SELECTORS.composer} [contenteditable="true"]`))
-    .or(page.locator(SELECTORS.composer))
-    .last();
+    .or(page.locator(`${SELECTORS.dialog} ${SELECTORS.composer}`))
+    .first();
 }
 
 async function focusComposer(page) {
+  await ensureComposerOpen(page);
   const box = contentEditableLocator(page);
   await box.waitFor({ state: "visible", timeout: 30_000 });
   await dismissBlockingLayers(page);
@@ -223,23 +242,25 @@ async function focusComposer(page) {
 async function openComposer(page) {
   await dismissBlockingLayers(page);
 
-  // Sempre preferir /compose/post (modal). O composer inline da home
-  // perde posts longos no Draft.js (só o último bloco sobrevive).
-  if (await page.locator(`${SELECTORS.dialog} ${SELECTORS.composer}`).isVisible().catch(() => false)) {
-    return;
-  }
+  if (await hasModalComposer(page)) return;
 
+  // Ir direto ao compose — mais confiável que home + atalho
   await gotoWithRetry(page, "https://x.com/compose/post");
+  await sleep(800);
+  await dismissBlockingLayers(page);
+
   try {
-    await page.locator(`${SELECTORS.dialog} ${SELECTORS.composer}`).waitFor({
-      state: "visible",
-      timeout: 20_000,
-    });
+    await modalComposerLocator(page).waitFor({ state: "visible", timeout: 25_000 });
     await dismissBlockingLayers(page);
     return;
   } catch {
-    // fallback: botão lateral / atalho
+    console.error("Aviso: /compose/post sem dialog — tentando botão Postar / tecla n…");
   }
+
+  // Fallback: home + abrir modal
+  await gotoWithRetry(page, "https://x.com/home");
+  await page.locator(SELECTORS.accountSwitcher).waitFor({ state: "visible", timeout: 45_000 }).catch(() => {});
+  await dismissBlockingLayers(page);
 
   const sideNav = page.locator(SELECTORS.sideNavPost);
   if (await sideNav.isVisible().catch(() => false)) {
@@ -252,29 +273,35 @@ async function openComposer(page) {
     await page.keyboard.press("n");
   }
 
-  await page.locator(`${SELECTORS.dialog} ${SELECTORS.composer}`).waitFor({
-    state: "visible",
-    timeout: 20_000,
-  });
+  await modalComposerLocator(page).waitFor({ state: "visible", timeout: 25_000 });
   await dismissBlockingLayers(page);
 }
 
-async function assertModalComposer(page) {
-  const open = await page
-    .locator(`${SELECTORS.dialog} ${SELECTORS.composer}`)
-    .isVisible()
-    .catch(() => false);
-  if (!open) {
+async function ensureComposerOpen(page) {
+  if (await hasModalComposer(page)) {
+    await dismissBlockingLayers(page);
+    return;
+  }
+  console.error("Aviso: modal fechou — reabrindo /compose/post…");
+  await openComposer(page);
+  if (!(await hasModalComposer(page))) {
     throw new Error(
       "Composer modal não está aberto. Posts longos no composer da home falham no Draft.js.",
     );
   }
 }
 
+async function assertModalComposer(page) {
+  await ensureComposerOpen(page);
+}
+
+/** Raiz do editor só dentro do dialog (nunca home). */
 async function readComposerText(page) {
   return page.evaluate(() => {
     const dialog = document.querySelector('[role="dialog"]');
-    const root = dialog && dialog.querySelector('[data-testid="tweetTextarea_0"]');
+    const root =
+      (dialog && dialog.querySelector('[data-testid="tweetTextarea_0"]')) ||
+      (dialog && dialog.querySelector('[data-testid^="tweetTextarea_"]'));
     if (!root) return "";
     const editable =
       root.getAttribute?.("contenteditable") === "true"
@@ -287,7 +314,9 @@ async function readComposerText(page) {
 async function fillViaExecCommand(page, text) {
   return page.evaluate((value) => {
     const dialog = document.querySelector('[role="dialog"]');
-    const root = dialog && dialog.querySelector('[data-testid="tweetTextarea_0"]');
+    const root =
+      (dialog && dialog.querySelector('[data-testid="tweetTextarea_0"]')) ||
+      (dialog && dialog.querySelector('[data-testid^="tweetTextarea_"]'));
     if (!root) return { ok: false, len: 0, reason: "no-modal" };
     root.focus();
     document.execCommand("selectAll", false);
@@ -346,7 +375,9 @@ async function fillViaClipboardPaste(page, text) {
 async function fillViaParagraphs(page, text) {
   return page.evaluate((value) => {
     const dialog = document.querySelector('[role="dialog"]');
-    const root = dialog && dialog.querySelector('[data-testid="tweetTextarea_0"]');
+    const root =
+      (dialog && dialog.querySelector('[data-testid="tweetTextarea_0"]')) ||
+      (dialog && dialog.querySelector('[data-testid^="tweetTextarea_"]'));
     if (!root) return { ok: false, len: 0, reason: "no-modal" };
     root.focus();
     document.execCommand("selectAll", false);
@@ -379,13 +410,21 @@ async function settledComposerLen(page, expectedLen) {
 }
 
 async function isPostButtonEnabled(page) {
-  return page
-    .locator(`${SELECTORS.dialog} [data-testid="tweetButton"]`)
-    .evaluate((el) => {
-      const node = el.closest("button") || el;
-      return !node.disabled && node.getAttribute("aria-disabled") !== "true";
-    })
-    .catch(() => false);
+  const locators = [
+    page.locator(`${SELECTORS.dialog} [data-testid="tweetButton"]`).first(),
+    page.locator('[data-testid="tweetButton"]').first(),
+  ];
+  for (const loc of locators) {
+    const enabled = await loc
+      .evaluate((el) => {
+        const node = el.closest("button") || el;
+        return !node.disabled && node.getAttribute("aria-disabled") !== "true";
+      })
+      .catch(() => null);
+    if (enabled === true) return true;
+    if (enabled === false) return false;
+  }
+  return false;
 }
 
 /**
@@ -565,7 +604,7 @@ export async function loginX() {
   }
 }
 
-export async function postTweet(text) {
+export async function postTweet(text, { dryRun = false } = {}) {
   if (!text || !text.trim()) {
     throw new Error("Texto do tweet vazio.");
   }
@@ -581,21 +620,37 @@ export async function postTweet(text) {
     context = await newContext(browser, true);
     const page = await context.newPage();
 
-    await gotoWithRetry(page, "https://x.com/home");
-    assertLoggedIn(page);
-
-    await page
-      .locator(SELECTORS.accountSwitcher)
-      .waitFor({ state: "visible", timeout: 45_000 })
-      .catch(() => {
-        throw new Error("Sessão inválida ou página não carregou. Rode: tweet login");
-      });
-
-    await dismissBlockingLayers(page);
+    // Vai direto ao compose (evita Escape na home fechar o modal)
     await openComposer(page);
-    // Garante editor Draft.js pronto (contenteditable interno)
+    assertLoggedIn(page);
+    if (!(await hasModalComposer(page))) {
+      // Confirma sessão na home se compose falhou
+      await gotoWithRetry(page, "https://x.com/home");
+      await page
+        .locator(SELECTORS.accountSwitcher)
+        .waitFor({ state: "visible", timeout: 45_000 })
+        .catch(() => {
+          throw new Error("Sessão inválida ou página não carregou. Rode: tweet login");
+        });
+      await openComposer(page);
+    }
+    await ensureComposerOpen(page);
     await contentEditableLocator(page).waitFor({ state: "visible", timeout: 20_000 });
     await fillComposer(page, text.trim());
+    await ensureComposerOpen(page);
+
+    if (dryRun) {
+      const filled = await readComposerText(page);
+      await context.storageState({ path: SESSION_PATH });
+      return {
+        ok: true,
+        dryRun: true,
+        username: getSessionUsername(),
+        text: text.trim(),
+        filledLen: [...filled].length,
+      };
+    }
+
     await clickPost(page);
     await sleep(2500);
 
