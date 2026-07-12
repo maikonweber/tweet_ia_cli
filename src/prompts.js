@@ -101,14 +101,21 @@ function lengthRules(style = DEFAULT_STYLE) {
 export function buildSystemPrompt({ tone, lang, mode, prompt, style = DEFAULT_STYLE }) {
   const tier = getXTier();
   const lines = [
-    `Você escreve posts prontos para publicar no X/Twitter (conta ${tier.label}).`,
-    "Regras OBRIGATÓRIAS:",
+    `Você é um ghostwriter de posts para a rede social X (Twitter), conta ${tier.label}.`,
+    "FORMATO DE SAÍDA (obrigatório):",
+    "- Devolva APENAS o texto do post, pronto para colar e publicar no X.",
+    "- NÃO use markdown (sem **, #, ```, tabelas, links em formato [texto](url)).",
+    "- NÃO escreva prefácio, título, assinatura, PS, nem 'aqui está o tweet'.",
+    "- NÃO escreva como artigo de blog, e-mail ou relatório — é post de rede social.",
+    "- Tom de timeline: direto, legível no celular, parágrafos curtos.",
+    "- Os primeiros ~280 caracteres devem funcionar como gancho no feed.",
+    "Regras de tamanho:",
     ...lengthRules(style).map((l) => `- ${l}`),
     ...styleRules(style),
     "- Sem aspas envolvendo o post inteiro.",
-    "- Sem numeração tipo 1/2; não explique — devolva SOMENTE o texto.",
-    `Tom padrão: ${tone}.`,
-    `Idioma padrão: ${lang}.`,
+    "- Sem thread numerada (1/n); um único post.",
+    `Tom: ${tone}.`,
+    `Idioma: ${lang}.`,
   ];
 
   if (mode?.systemExtra) {
@@ -125,12 +132,13 @@ export function buildUserPrompt({ topic, tone, lang, style = DEFAULT_STYLE }) {
   const tier = getXTier();
   const max = charCap(style);
   return [
-    `Tema: ${topic}`,
+    `Escreva UM post para o X sobre: ${topic}`,
     `Tom: ${tone}`,
     `Idioma: ${lang}`,
     `Limite: ${max} caracteres (X ${tier.label}${style.longForm ? ", long-form" : ""}).`,
     `Hashtags: ${style.allowHashtags ? `até ${tier.maxHashtagsWhenEnabled}` : "proibidas"}`,
     `Emojis: ${style.allowEmojis ? `até ${tier.maxEmojisWhenEnabled}` : "proibidos"}`,
+    "Resposta = só o texto do post.",
   ].join("\n");
 }
 
@@ -153,17 +161,17 @@ export function buildTransformMessages({ text, mode, modes, prompt, style = DEFA
   if (prompt) parts.push(prompt);
   if (!parts.length) {
     parts.push(
-      `Melhore o post abaixo mantendo a ideia. Devolva somente o texto final (máx. ${max} caracteres, X ${tier.label}).`,
+      `Melhore o post abaixo para a rede social X. Devolva somente o texto final (máx. ${max} caracteres, X ${tier.label}).`,
     );
   }
 
   return {
     system: [
-      `Você edita textos para X/Twitter (conta ${tier.label}).`,
+      `Você edita posts para a rede social X/Twitter (conta ${tier.label}).`,
+      "Saída = texto pronto para publicar (sem markdown, sem explicação, sem prefácio).",
       `Limite rígido: ${max} caracteres.`,
       ...styleRules(style),
-      "Não explique: devolva somente o texto final.",
-      "Sem aspas envolvendo o texto inteiro.",
+      "Tom de rede social, não artigo.",
     ].join("\n"),
     user: `${parts.join("\n\n")}\n\nTexto:\n${text}`,
   };

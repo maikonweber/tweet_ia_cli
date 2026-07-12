@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { loadConfig, loadOpenRouterOnly } from "../src/config.js";
-import { DEFAULT_STYLE, describeTier, getMaxChars, getXTier } from "../src/limits.js";
+import { getDbPath, getPost, getStats, listPosts, markPublished, savePost } from "../src/db.js";
+import { DEFAULT_STYLE, describeTier, getMaxChars, getXTier, tweetLength } from "../src/limits.js";
 import { generateTweet, transformTweet } from "../src/openrouter.js";
 import { cascadePriceTable, formatUsd } from "../src/pricing.js";
 import { PROMPT_MODES } from "../src/prompts.js";
@@ -21,6 +22,12 @@ const COMMAND_ALIASES = {
   login: "login",
   logout: "logout",
   whoami: "whoami",
+  history: "history",
+  h: "history",
+  stats: "stats",
+  s: "stats",
+  limits: "limits",
+  limit: "limits",
 };
 
 function usage() {
@@ -39,11 +46,15 @@ Atalhos:
   tweet g "tema"               # generate
   tweet t "texto" -s           # transform + ortografia
   tweet costs                  # tabela de preços da cascata
+  tweet history                # últimos posts salvos no SQLite
+  tweet stats                  # tokens / custo acumulado
+  tweet limits                 # limite de caracteres da conta
 
 Uso:
   tweet login
   tweet p "Casamento Sangrento é bom demais" -r -e
   tweet generate "tema" --mode english
+  tweet g "tema" --long        # post longo Premium (até 25.000)
   tweet logout
 
 Comandos:
@@ -52,6 +63,9 @@ Comandos:
   t | transform <texto>     Só transforma (não publica)
   a | ai-post <tema>        Gera e publica
   c | costs                 Lista custo por modelo (cascata)
+  h | history [n]           Histórico SQLite (padrão 20)
+  s | stats                 Uso de tokens e custos
+  limits                    Limite de caracteres (tier atual)
   login / logout / whoami
 
 Opções curtas:
@@ -78,6 +92,7 @@ Conta X (.env X_ACCOUNT_TIER=premium|free):
 ${describeTier()}
 
 Por padrão: sem hashtags/emojis. Premium libera até 25k chars.
+Histórico/custos: .data/tweet-ia.sqlite (tweet history | tweet stats)
 `.trim());
 }
 
@@ -228,6 +243,82 @@ function printCostsTable() {
   console.log("Após cada generate/transform/post -r, o custo real da chamada é exibido.");
 }
 
+function printLimits() {
+  const tier = getXTier();
+  const max = getMaxChars({ ...DEFAULT_STYLE, longForm: true });
+  console.log(`Conta X: ${tier.label} (X_ACCOUNT_TIER)`);
+  console.log(`Limite máximo por post: ${max.toLocaleString("pt-BR")} caracteres`);
+  if (tier.longerPosts) {
+    console.log(`Longer posts: sim (use --long / -l para orientar a IA a escrever longo)`);
+    console.log(`Sugestão curta (feed): ${tier.preferredMinChars}–${tier.preferredMaxChars} chars`);
+    console.log(`Sugestão longa: até ~${tier.longPreferredMaxChars.toLocaleString("pt-BR")} chars (teto ${max.toLocaleString("pt-BR")})`);
+    console.log(`Feed: posts longos aparecem com "Mostrar mais" após ~280 chars`);
+  } else {
+    console.log("Longer posts: não (conta free)");
+  }
+  console.log(`\n${describeTier()}`);
+}
+
+function printHistory(limit = 20) {
+  const rows = listPosts({ limit });
+  if (!rows.length) {
+    console.log("Nenhum post no SQLite ainda. Gere ou publique algo primeiro.");
+    console.log(`DB: ${getDbPath()}`);
+    return;
+  }
+  console.log(`Últimos ${rows.length} registros (${getDbPath()}):\n`);
+  for (const r of rows) {
+    const cost = formatUsd(r.cost_usd || 0);
+    const preview = String(r.preview || "").replace(/\s+/g, " ").slice(0, 90);
+    console.log(
+      `#${r.id}  ${r.created_at}  ${String(r.status).padEnd(11)}  ${r.char_count}c  ${r.total_tokens || 0} tok  ${cost}`,
+    );
+    console.log(`     ${r.command || "-"} | ${r.model || "sem modelo"} | ${preview}${preview.length >= 90 ? "…" : ""}`);
+  }
+}
+
+function printStats() {
+  const { posts, usage, byModel, dbPath } = getStats();
+  console.log(`SQLite: ${dbPath}\n`);
+  console.log("--- Posts ---");
+  console.log(`Total registros: ${posts.total_posts || 0}`);
+  console.log(`Publicados:      ${posts.published || 0}`);
+  console.log(`Não publicados:  ${posts.drafts || 0}`);
+  console.log(`Chars somados:   ${posts.chars_total || 0}`);
+  console.log("\n--- Tokens / custo (posts) ---");
+  console.log(
+    `Tokens: ${(posts.prompt_tokens || 0)} in + ${(posts.completion_tokens || 0)} out = ${posts.total_tokens || 0}`,
+  );
+  console.log(`Custo:  ${formatUsd(posts.cost_usd || 0)}`);
+  console.log("\n--- Chamadas LLM (usage_events) ---");
+  console.log(`Chamadas: ${usage.calls || 0}`);
+  console.log(
+    `Tokens:   ${(usage.prompt_tokens || 0)} in + ${(usage.completion_tokens || 0)} out = ${usage.total_tokens || 0}`,
+  );
+  console.log(`Custo:    ${formatUsd(usage.cost_usd || 0)}`);
+  if (byModel?.length) {
+    console.log("\n--- Por modelo ---");
+    for (const m of byModel) {
+      console.log(
+        `  ${(m.model || "?").padEnd(48)} ${String(m.calls).padStart(3)} calls  ${String(m.total_tokens || 0).padStart(6)} tok  ${formatUsd(m.cost_usd || 0)}`,
+      );
+    }
+  }
+}
+
+function showPostDetail(id) {
+  const row = getPost(id);
+  if (!row) {
+    console.log(`Post #${id} não encontrado.`);
+    return;
+  }
+  console.log(`#${row.id}  ${row.created_at}  ${row.status}  ${row.command || "-"}`);
+  console.log(`Modelo: ${row.model || "n/d"} | ${row.char_count} chars | ${row.total_tokens} tok | ${formatUsd(row.cost_usd)}`);
+  if (row.username) console.log(`@${row.username}${row.published_at ? ` · publicado ${row.published_at}` : ""}`);
+  console.log("\n" + row.text);
+}
+
+
 async function maybeTransform(openrouter, text, flags) {
   if (!hasModesOrPrompt(flags)) return { text, meta: null };
   return transformTweet(openrouter, {
@@ -273,6 +364,36 @@ async function main() {
     return;
   }
 
+  if (command === "limits") {
+    printLimits();
+    return;
+  }
+
+  if (command === "history") {
+    if (rest && /^\d+$/.test(rest.trim())) {
+      const idOrLimit = Number(rest.trim());
+      // tweet history 5 → limit; tweet history #12 or detail if asking show?
+      // Convention: history [limit] ; history show <id> via rest "show 3"
+      printHistory(idOrLimit);
+      return;
+    }
+    if (rest?.startsWith("show ")) {
+      showPostDetail(rest.slice(5).trim());
+      return;
+    }
+    if (rest && /^#?\d+$/.test(rest.trim())) {
+      showPostDetail(rest.replace("#", "").trim());
+      return;
+    }
+    printHistory(20);
+    return;
+  }
+
+  if (command === "stats") {
+    printStats();
+    return;
+  }
+
   if (command === "generate") {
     if (!rest) throw new Error('Informe o tema: tweet g "seu tema"');
     const { openrouter } = loadOpenRouterOnly();
@@ -287,8 +408,23 @@ async function main() {
     printText(text, "Prévia", style);
     printCost(meta);
 
+    const postId = savePost({
+      command: "generate",
+      status: "generated",
+      text,
+      meta,
+      topic: rest,
+      lang: flags.lang,
+      tone: flags.tone,
+      modes: flags.modes,
+      longForm: flags.longForm,
+      purpose: "generate",
+    });
+    console.log(`Salvo no SQLite (#${postId}).`);
+
     if (flags.yes) {
       const published = await postTweet(text);
+      markPublished(postId, { username: published.username });
       console.log(`Publicado via navegador${published.username ? ` (@${published.username})` : ""}.`);
       return;
     }
@@ -300,6 +436,7 @@ async function main() {
     }
 
     const published = await postTweet(text);
+    markPublished(postId, { username: published.username });
     console.log(`Publicado via navegador${published.username ? ` (@${published.username})` : ""}.`);
     return;
   }
@@ -320,6 +457,16 @@ async function main() {
     });
     printText(text, "Transformado", style);
     printCost(meta);
+    const postId = savePost({
+      command: "transform",
+      status: "transformed",
+      text,
+      meta,
+      modes: flags.modes,
+      longForm: flags.longForm,
+      purpose: "transform",
+    });
+    console.log(`Salvo no SQLite (#${postId}).`);
     return;
   }
 
@@ -327,11 +474,24 @@ async function main() {
     if (!rest) throw new Error('Informe o texto: tweet p "seu tweet"');
     const { openrouter } = loadOpenRouterOnly();
     let text = rest;
+    let meta = null;
+    let postId = null;
     if (hasModesOrPrompt(flags)) {
       const result = await maybeTransform(openrouter, rest, flags);
       text = result.text;
+      meta = result.meta;
       printText(text, "Prévia", style);
-      printCost(result.meta);
+      printCost(meta);
+      postId = savePost({
+        command: "post",
+        status: "generated",
+        text,
+        meta,
+        modes: flags.modes,
+        longForm: flags.longForm,
+        purpose: "transform",
+      });
+      console.log(`Salvo no SQLite (#${postId}).`);
       if (!flags.yes) {
         const ok = await confirm("Publicar este texto?");
         if (!ok) {
@@ -341,7 +501,19 @@ async function main() {
       }
     }
     const published = await postTweet(text);
+    if (postId) {
+      markPublished(postId, { username: published.username });
+    } else {
+      postId = savePost({
+        command: "post",
+        status: "published",
+        text,
+        username: published.username,
+        longForm: flags.longForm || tweetLength(text) > 280,
+      });
+    }
     console.log(`Publicado via navegador${published.username ? ` (@${published.username})` : ""}.`);
+    console.log(`SQLite #${postId}`);
     console.log(published.text);
     return;
   }
@@ -361,6 +533,20 @@ async function main() {
     printText(text, "Prévia", style);
     printCost(meta);
 
+    const postId = savePost({
+      command: "ai-post",
+      status: "generated",
+      text,
+      meta,
+      topic: rest,
+      lang: flags.lang,
+      tone: flags.tone,
+      modes: flags.modes,
+      longForm: flags.longForm,
+      purpose: "generate",
+    });
+    console.log(`Salvo no SQLite (#${postId}).`);
+
     if (!flags.yes) {
       const ok = await confirm("Publicar este tweet no navegador?");
       if (!ok) {
@@ -370,6 +556,7 @@ async function main() {
     }
 
     const published = await postTweet(text);
+    markPublished(postId, { username: published.username });
     console.log(`Publicado via navegador${published.username ? ` (@${published.username})` : ""}.`);
     return;
   }

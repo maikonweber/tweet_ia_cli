@@ -2,6 +2,8 @@ node_modules/
 .env
 .env.local
 .auth/
+.debug/
+.data/
 .twitter-tokens.json
 dist/
 *.log

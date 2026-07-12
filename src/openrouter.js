@@ -7,7 +7,6 @@ import {
   resolveModes,
 } from "./prompts.js";
 import {
-  applyStyleGuards,
   assertWithinLimit,
   DEFAULT_STYLE,
   getMaxChars,
@@ -19,6 +18,7 @@ import {
   formatUsd,
   getModelPrice,
 } from "./pricing.js";
+import { looksLikeSocialPost, sanitizeForX } from "./sanitize.js";
 
 function isRetryableStatus(status) {
   return [402, 408, 429, 502, 503, 504].includes(status);
@@ -222,9 +222,29 @@ function mergeMeta(base, extraUsage, extraCost) {
 
 async function enforceCharLimit(openrouter, text, style = DEFAULT_STYLE, meta = null) {
   const maxChars = getMaxChars(style);
-  let current = applyStyleGuards(text, style);
+  let current = sanitizeForX(text, style);
   let len = tweetLength(current);
   let costMeta = meta;
+
+  // Se ainda parecer markdown/artigo, pede reescrita social
+  if (!looksLikeSocialPost(current)) {
+    console.error("Aviso: saída não parece post de rede social — reescrevendo para o X...");
+    const result = await chatCompletion(openrouter, {
+      system: [
+        "Reescreva o texto abaixo como UM post pronto para a rede social X.",
+        "Sem markdown, sem prefácio, sem explicação. Só o texto do post.",
+        `Máximo ${maxChars} caracteres.`,
+      ].join("\n"),
+      user: current,
+      temperature: 0.4,
+    });
+    current = sanitizeForX(result.text, style);
+    costMeta = mergeMeta(costMeta, result.usage, {
+      ...result.cost,
+      attempts: result.attempts,
+    });
+    len = tweetLength(current);
+  }
 
   for (let attempt = 1; attempt <= 2 && len > maxChars; attempt++) {
     console.error(
@@ -232,7 +252,7 @@ async function enforceCharLimit(openrouter, text, style = DEFAULT_STYLE, meta = 
     );
     const { system, user } = buildShortenMessages(current, len, style);
     const result = await chatCompletion(openrouter, { system, user, temperature: 0.3 });
-    current = applyStyleGuards(result.text, style);
+    current = sanitizeForX(result.text, style);
     costMeta = mergeMeta(costMeta, result.usage, {
       ...result.cost,
       attempts: result.attempts,
@@ -249,6 +269,11 @@ async function enforceCharLimit(openrouter, text, style = DEFAULT_STYLE, meta = 
     }
     console.error(`Aviso: corte local para ${tweetLength(cut)}/${maxChars}.`);
     current = cut;
+  }
+
+  current = sanitizeForX(current, style);
+  if (!current) {
+    throw new Error("A IA não gerou um texto válido para publicar no X.");
   }
 
   return {

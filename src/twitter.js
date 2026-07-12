@@ -194,31 +194,51 @@ async function dismissBlockingLayers(page) {
     .catch(() => {});
 }
 
+function contentEditableLocator(page) {
+  // No X, data-testid="tweetTextarea_0" JÁ é o contenteditable (não um ancestral)
+  return page
+    .locator(`${SELECTORS.dialog} ${SELECTORS.composer}[contenteditable="true"]`)
+    .or(page.locator(`${SELECTORS.dialog} ${SELECTORS.composer} [contenteditable="true"]`))
+    .or(page.locator(`${SELECTORS.composer}[contenteditable="true"]`))
+    .or(page.locator(`${SELECTORS.composer} [contenteditable="true"]`))
+    .or(page.locator(SELECTORS.composer))
+    .last();
+}
+
 async function focusComposer(page) {
-  const box = composerLocator(page);
+  const box = contentEditableLocator(page);
   await box.waitFor({ state: "visible", timeout: 30_000 });
   await dismissBlockingLayers(page);
 
   try {
-    await box.click({ delay: 40, timeout: 5_000 });
+    await box.click({ delay: 50, timeout: 8_000 });
   } catch {
-    await box.evaluate((el) => {
-      el.focus();
-      try {
-        el.click();
-      } catch {
-        // ignore
-      }
+    await box.click({ force: true, timeout: 5_000 }).catch(async () => {
+      await box.evaluate((el) => el.focus());
     });
   }
-  await sleep(250);
+  await sleep(350);
 }
 
 async function openComposer(page) {
   await dismissBlockingLayers(page);
 
+  // Sempre preferir /compose/post (modal). O composer inline da home
+  // perde posts longos no Draft.js (só o último bloco sobrevive).
   if (await page.locator(`${SELECTORS.dialog} ${SELECTORS.composer}`).isVisible().catch(() => false)) {
     return;
+  }
+
+  await gotoWithRetry(page, "https://x.com/compose/post");
+  try {
+    await page.locator(`${SELECTORS.dialog} ${SELECTORS.composer}`).waitFor({
+      state: "visible",
+      timeout: 20_000,
+    });
+    await dismissBlockingLayers(page);
+    return;
+  } catch {
+    // fallback: botão lateral / atalho
   }
 
   const sideNav = page.locator(SELECTORS.sideNavPost);
@@ -228,133 +248,247 @@ async function openComposer(page) {
     } catch {
       await sideNav.click({ force: true });
     }
-    await composerLocator(page).waitFor({ state: "visible", timeout: 20_000 });
-    await dismissBlockingLayers(page);
-    return;
+  } else {
+    await page.keyboard.press("n");
   }
 
-  await page.keyboard.press("n");
-  try {
-    await composerLocator(page).waitFor({ state: "visible", timeout: 10_000 });
-    await dismissBlockingLayers(page);
-    return;
-  } catch {
-    // continua
-  }
-
-  await gotoWithRetry(page, "https://x.com/compose/post");
-  await composerLocator(page).waitFor({ state: "visible", timeout: 20_000 });
+  await page.locator(`${SELECTORS.dialog} ${SELECTORS.composer}`).waitFor({
+    state: "visible",
+    timeout: 20_000,
+  });
   await dismissBlockingLayers(page);
+}
+
+async function assertModalComposer(page) {
+  const open = await page
+    .locator(`${SELECTORS.dialog} ${SELECTORS.composer}`)
+    .isVisible()
+    .catch(() => false);
+  if (!open) {
+    throw new Error(
+      "Composer modal não está aberto. Posts longos no composer da home falham no Draft.js.",
+    );
+  }
 }
 
 async function readComposerText(page) {
   return page.evaluate(() => {
     const dialog = document.querySelector('[role="dialog"]');
-    const el =
-      (dialog && dialog.querySelector('[data-testid="tweetTextarea_0"]')) ||
-      [...document.querySelectorAll('[data-testid="tweetTextarea_0"]')].at(-1);
-    if (!el) return "";
-    return (el.innerText || el.textContent || "").replace(/\n$/, "");
+    const root = dialog && dialog.querySelector('[data-testid="tweetTextarea_0"]');
+    if (!root) return "";
+    const editable =
+      root.getAttribute?.("contenteditable") === "true"
+        ? root
+        : root.querySelector?.('[contenteditable="true"]') || root;
+    return (editable.innerText || editable.textContent || "").replace(/\n$/, "");
   });
 }
 
+async function fillViaExecCommand(page, text) {
+  return page.evaluate((value) => {
+    const dialog = document.querySelector('[role="dialog"]');
+    const root = dialog && dialog.querySelector('[data-testid="tweetTextarea_0"]');
+    if (!root) return { ok: false, len: 0, reason: "no-modal" };
+    root.focus();
+    document.execCommand("selectAll", false);
+    const ok = document.execCommand("insertText", false, value);
+    return { ok, len: [...(root.innerText || "")].length };
+  }, text);
+}
+
 async function clearComposer(page) {
-  await focusComposer(page);
   await page.keyboard.press("Control+A");
-  await sleep(80);
   await page.keyboard.press("Backspace");
-  await sleep(120);
-  await page.keyboard.press("Control+A");
-  await page.keyboard.press("Delete");
   await sleep(150);
 }
 
 /**
- * Longer posts Premium quebram com execCommand/insertText parcial.
- * Ordem: clipboard paste → keyboard.insertText → type por blocos.
+ * Playwright keyboard.insertText usa InputEvent/CDP — Draft.js registra o estado
+ * e habilita o botão Postar. execCommand sozinho preenche o DOM mas deixa Postar disabled.
  */
-async function fillComposer(page, text) {
-  const expected = text.trim();
-  const expectedLen = [...expected].length;
-
+async function fillViaKeyboardInsert(page, text) {
+  await focusComposer(page);
   await clearComposer(page);
+  await page.keyboard.insertText(text);
+  return { ok: true };
+}
 
-  let ok = false;
-
-  // 1) Colar (melhor para multilinha / 25k)
-  try {
-    await page.context().grantPermissions(["clipboard-read", "clipboard-write"], {
-      origin: "https://x.com",
-    });
-  } catch {
-    // ignore
-  }
-
-  try {
-    const pasted = await page.evaluate(async (value) => {
+async function fillViaClipboardPaste(page, text) {
+  await focusComposer(page);
+  await clearComposer(page);
+  const written = await page
+    .evaluate(async (value) => {
       try {
         await navigator.clipboard.writeText(value);
         return true;
       } catch {
         return false;
       }
-    }, expected);
+    }, text)
+    .catch(() => false);
+  if (!written) {
+    // fallback CDP sem permissão de clipboard
+    await page.context().grantPermissions(["clipboard-read", "clipboard-write"], {
+      origin: "https://x.com",
+    }).catch(() => {});
+    await page.evaluate(async (value) => {
+      await navigator.clipboard.writeText(value);
+    }, text);
+  }
+  await page.keyboard.press("Control+V");
+  return { ok: true };
+}
 
-    if (pasted) {
-      await page.keyboard.press("Control+V");
-      await sleep(600);
-      const got = await readComposerText(page);
-      if ([...got].length >= Math.floor(expectedLen * 0.9)) {
+/**
+ * InsertText de um bloco longo com \\n via execCommand costuma colapsar no Draft.js
+ * OU deixar o botão Postar desabilitado (DOM visual sem ContentState).
+ */
+async function fillViaParagraphs(page, text) {
+  return page.evaluate((value) => {
+    const dialog = document.querySelector('[role="dialog"]');
+    const root = dialog && dialog.querySelector('[data-testid="tweetTextarea_0"]');
+    if (!root) return { ok: false, len: 0, reason: "no-modal" };
+    root.focus();
+    document.execCommand("selectAll", false);
+    document.execCommand("delete", false);
+
+    const lines = value.replace(/\r\n/g, "\n").split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      if (i > 0) {
+        document.execCommand("insertParagraph", false) ||
+          document.execCommand("insertHTML", false, "<br>") ||
+          document.execCommand("insertText", false, "\n");
+      }
+      if (lines[i].length) {
+        document.execCommand("insertText", false, lines[i]);
+      }
+    }
+    return { ok: true, len: [...(root.innerText || "")].length };
+  }, text);
+}
+
+async function settledComposerLen(page, expectedLen) {
+  // Draft.js reconcilia depois do insert — ler cedo demais dá falso positivo.
+  let len = 0;
+  for (let i = 0; i < 5; i++) {
+    await sleep(350);
+    len = [...(await readComposerText(page))].length;
+    if (len >= Math.floor(expectedLen * 0.85)) return len;
+  }
+  return len;
+}
+
+async function isPostButtonEnabled(page) {
+  return page
+    .locator(`${SELECTORS.dialog} [data-testid="tweetButton"]`)
+    .evaluate((el) => {
+      const node = el.closest("button") || el;
+      return !node.disabled && node.getAttribute("aria-disabled") !== "true";
+    })
+    .catch(() => false);
+}
+
+/**
+ * Longer posts Premium: prefer keyboard.insertText / clipboard (habilitam Postar).
+ * Sempre no modal /compose/post; validar head+tail após settle.
+ */
+async function fillComposer(page, text) {
+  const expected = text.replace(/\r\n/g, "\n").trim();
+  const expectedLen = [...expected].length;
+  const expectedHead = expected.slice(0, 48);
+  const expectedTail = expected.slice(-48);
+
+  await assertModalComposer(page);
+  await focusComposer(page);
+  await sleep(200);
+
+  const tryMethods = [
+    {
+      name: "keyboard-insertText",
+      run: async () => {
+        await fillViaKeyboardInsert(page, expected);
+        return settledComposerLen(page, expectedLen);
+      },
+    },
+    {
+      name: "clipboard-CtrlV",
+      run: async () => {
+        await fillViaClipboardPaste(page, expected);
+        return settledComposerLen(page, expectedLen);
+      },
+    },
+    {
+      name: "paragraphs-insertText",
+      run: async () => {
+        await focusComposer(page);
+        await fillViaParagraphs(page, expected);
+        return settledComposerLen(page, expectedLen);
+      },
+    },
+    {
+      name: "execCommand-bulk",
+      run: async () => {
+        await focusComposer(page);
+        await clearComposer(page);
+        await fillViaExecCommand(page, expected);
+        return settledComposerLen(page, expectedLen);
+      },
+    },
+  ];
+
+  let ok = false;
+  let methodUsed = "";
+  let finalLen = 0;
+
+  for (const method of tryMethods) {
+    try {
+      await assertModalComposer(page);
+      const len = await method.run();
+      finalLen = len;
+      const body = await readComposerText(page);
+      const hasHead = body.includes(expectedHead.slice(0, 32));
+      const hasTail = body.includes(expectedTail.slice(-32));
+      const btnOk = await isPostButtonEnabled(page);
+      if (len >= Math.floor(expectedLen * 0.85) && hasHead && hasTail && btnOk) {
         ok = true;
+        methodUsed = method.name;
+        break;
       }
-    }
-  } catch {
-    // ignore
-  }
-
-  // 2) Playwright insertText (um evento de input com o texto inteiro)
-  if (!ok) {
-    await clearComposer(page);
-    await page.keyboard.insertText(expected);
-    await sleep(500);
-    const got = await readComposerText(page);
-    if ([...got].length >= Math.floor(expectedLen * 0.9)) {
-      ok = true;
-    }
-  }
-
-  // 3) Digitar por parágrafos (Shift+Enter entre blocos no Draft.js)
-  if (!ok) {
-    await clearComposer(page);
-    const blocks = expected.split(/\n+/);
-    for (let i = 0; i < blocks.length; i++) {
-      if (blocks[i]) {
-        await page.keyboard.insertText(blocks[i]);
+      // Se texto ok mas botão disabled, tenta nudge leve
+      if (len >= Math.floor(expectedLen * 0.85) && hasHead && hasTail && !btnOk) {
+        await page.keyboard.type(".");
+        await page.keyboard.press("Backspace");
+        await sleep(400);
+        if (await isPostButtonEnabled(page)) {
+          ok = true;
+          methodUsed = `${method.name}+nudge`;
+          break;
+        }
       }
-      if (i < blocks.length - 1) {
-        await page.keyboard.down("Shift");
-        await page.keyboard.press("Enter");
-        await page.keyboard.up("Shift");
-        await sleep(40);
-      }
-    }
-    await sleep(400);
-    const got = await readComposerText(page);
-    if ([...got].length >= Math.floor(expectedLen * 0.9)) {
-      ok = true;
+      console.error(
+        `Aviso: ${method.name} → ${len}/${expectedLen} (head=${hasHead} tail=${hasTail} btn=${btnOk}).`,
+      );
+    } catch (err) {
+      console.error(
+        `Aviso: método ${method.name} falhou — ${String(err.message || err).slice(0, 120)}`,
+      );
     }
   }
 
-  const finalText = await readComposerText(page);
-  const finalLen = [...finalText].length;
-  if (!ok || finalLen < Math.floor(expectedLen * 0.85)) {
+  finalLen = [...(await readComposerText(page))].length;
+  const body = await readComposerText(page);
+  const hasHead = body.includes(expectedHead.slice(0, 32));
+  const hasTail = body.includes(expectedTail.slice(-32));
+  const btnOk = await isPostButtonEnabled(page);
+  if (!ok || finalLen < Math.floor(expectedLen * 0.85) || !hasHead || !hasTail || !btnOk) {
     throw new Error(
-      `Falha ao preencher o composer: foram ${finalLen}/${expectedLen} caracteres. ` +
+      `Falha ao preencher o composer: foram ${finalLen}/${expectedLen} caracteres` +
+        ` (head=${hasHead} tail=${hasTail} btn=${btnOk}). ` +
         "Tente de novo com X_HEADLESS=false para inspecionar.",
     );
   }
 
-  console.error(`Composer OK: ${finalLen}/${expectedLen} caracteres.`);
+  console.error(`Composer OK via ${methodUsed}: ${finalLen}/${expectedLen} caracteres.`);
   await sleep(300);
 }
 
@@ -459,9 +593,11 @@ export async function postTweet(text) {
 
     await dismissBlockingLayers(page);
     await openComposer(page);
+    // Garante editor Draft.js pronto (contenteditable interno)
+    await contentEditableLocator(page).waitFor({ state: "visible", timeout: 20_000 });
     await fillComposer(page, text.trim());
     await clickPost(page);
-    await sleep(2000);
+    await sleep(2500);
 
     await context.storageState({ path: SESSION_PATH });
 
