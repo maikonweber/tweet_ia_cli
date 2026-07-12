@@ -51,7 +51,13 @@ export function loadOpenRouterOnly() {
       baseUrl: optional("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").replace(/\/$/, ""),
       /** Cascata: free primeiro, depois pago barato */
       models,
-      maxTokens: Number(optional("OPENROUTER_MAX_TOKENS", "280")),
+      // Premium long posts precisam de mais tokens de saída
+      maxTokens: Number(
+        optional(
+          "OPENROUTER_MAX_TOKENS",
+          optional("X_ACCOUNT_TIER", "premium").toLowerCase() === "free" ? "280" : "2048",
+        ),
+      ),
     },
   };
 }

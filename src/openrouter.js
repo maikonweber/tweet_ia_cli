@@ -8,10 +8,10 @@ import {
 } from "./prompts.js";
 import {
   applyStyleGuards,
-  assertWithinFreeLimit,
+  assertWithinLimit,
   DEFAULT_STYLE,
+  getMaxChars,
   tweetLength,
-  X_FREE_LIMITS,
 } from "./limits.js";
 import {
   estimateCostUsd,
@@ -220,14 +220,15 @@ function mergeMeta(base, extraUsage, extraCost) {
   };
 }
 
-async function enforceFreeLimit(openrouter, text, style = DEFAULT_STYLE, meta = null) {
+async function enforceCharLimit(openrouter, text, style = DEFAULT_STYLE, meta = null) {
+  const maxChars = getMaxChars(style);
   let current = applyStyleGuards(text, style);
   let len = tweetLength(current);
   let costMeta = meta;
 
-  for (let attempt = 1; attempt <= 2 && len > X_FREE_LIMITS.maxChars; attempt++) {
+  for (let attempt = 1; attempt <= 2 && len > maxChars; attempt++) {
     console.error(
-      `Aviso: ${len}/${X_FREE_LIMITS.maxChars} caracteres — encurtando (tentativa ${attempt})...`,
+      `Aviso: ${len}/${maxChars} caracteres — encurtando (tentativa ${attempt})...`,
     );
     const { system, user } = buildShortenMessages(current, len, style);
     const result = await chatCompletion(openrouter, { system, user, temperature: 0.3 });
@@ -239,19 +240,19 @@ async function enforceFreeLimit(openrouter, text, style = DEFAULT_STYLE, meta = 
     len = tweetLength(current);
   }
 
-  if (len > X_FREE_LIMITS.maxChars) {
+  if (len > maxChars) {
     const chars = [...current];
-    let cut = chars.slice(0, X_FREE_LIMITS.maxChars).join("");
+    let cut = chars.slice(0, maxChars).join("");
     const lastSpace = cut.lastIndexOf(" ");
-    if (lastSpace > X_FREE_LIMITS.maxChars * 0.6) {
+    if (lastSpace > maxChars * 0.6) {
       cut = cut.slice(0, lastSpace).trim();
     }
-    console.error(`Aviso: corte local para ${tweetLength(cut)}/${X_FREE_LIMITS.maxChars}.`);
+    console.error(`Aviso: corte local para ${tweetLength(cut)}/${maxChars}.`);
     current = cut;
   }
 
   return {
-    text: assertWithinFreeLimit(current),
+    text: assertWithinLimit(current, style),
     meta: costMeta,
   };
 }
@@ -274,9 +275,9 @@ export async function generateTweet(
 ) {
   const resolvedList =
     Array.isArray(modes) && modes.length
-      ? resolveModes(modes)
+      ? resolveModes(modes, style)
       : mode
-        ? [resolveMode(mode)]
+        ? [resolveMode(mode, style)]
         : [];
   const primary = resolvedList[resolvedList.length - 1] || null;
   const effectiveLang = resolvedList.some((m) => m.id === "english") ? "en" : lang;
@@ -295,7 +296,7 @@ export async function generateTweet(
   });
   const user = buildUserPrompt({ topic, tone, lang: effectiveLang, style });
   const result = await chatCompletion(openrouter, { system, user, temperature: 0.7 });
-  const enforced = await enforceFreeLimit(openrouter, result.text, style, {
+  const enforced = await enforceCharLimit(openrouter, result.text, style, {
     ...result.cost,
     attempts: result.attempts,
     usage: result.usage,
@@ -310,9 +311,9 @@ export async function transformTweet(
   if (!text?.trim()) throw new Error("Texto vazio para transformar.");
   const resolvedList =
     Array.isArray(modes) && modes.length
-      ? resolveModes(modes)
+      ? resolveModes(modes, style)
       : mode
-        ? [resolveMode(mode)]
+        ? [resolveMode(mode, style)]
         : [];
   if (!resolvedList.length && !prompt) {
     throw new Error("Informe --mode / -r / -e / -s e/ou --prompt \"...\"");
@@ -324,7 +325,7 @@ export async function transformTweet(
     style,
   });
   const result = await chatCompletion(openrouter, { system, user, temperature: 0.35 });
-  const enforced = await enforceFreeLimit(openrouter, result.text, style, {
+  const enforced = await enforceCharLimit(openrouter, result.text, style, {
     ...result.cost,
     attempts: result.attempts,
     usage: result.usage,

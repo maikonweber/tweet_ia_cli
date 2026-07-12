@@ -239,15 +239,19 @@ OPENROUTER_VERBOSE=true          # mostra qual modelo respondeu
 OPENROUTER_SKIP_FREE=true        # pula free e vai direto ao pago barato
 ```
 
-Na geração e na publicação o CLI respeita o **Free**:
+Na geração e na publicação o CLI respeita o tier da conta (`X_ACCOUNT_TIER`):
 
-| Regra | Valor |
-|-------|--------|
-| Caracteres | máximo **280** |
-| Hashtags | **desligadas** por padrão (`--hashtags` para até 2) |
-| Emojis | **desligados** por padrão (`--emojis` para até 2) |
+| Tier | Caracteres | Articles |
+|------|------------|----------|
+| **Free** | **280** | Não |
+| **Premium** | até **25.000** (longer posts) | Sim (editor no site) |
 
-Se a IA passar de 280, o CLI **encurta automaticamente** (até 2 tentativas) antes de exibir/publicar.
+- Timeline ainda corta ~280 + **Show more**
+- Longer posts ≠ Articles
+- Use `--long` para orientar texto longo
+- Hashtags/emojis off por padrão (`--hashtags` / `--emojis`)
+
+Se a IA passar do teto, o CLI encurta automaticamente.
 
 - **OpenRouter** cuida só do texto; **Playwright** publica como usuário no site.
 - Mantenha `X_HEADLESS=false` no início para acompanhar o navegador.

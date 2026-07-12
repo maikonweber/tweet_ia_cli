@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { loadConfig, loadOpenRouterOnly } from "../src/config.js";
-import { DEFAULT_STYLE } from "../src/limits.js";
+import { DEFAULT_STYLE, describeTier, getMaxChars, getXTier } from "../src/limits.js";
 import { generateTweet, transformTweet } from "../src/openrouter.js";
 import { cascadePriceTable, formatUsd } from "../src/pricing.js";
 import { PROMPT_MODES } from "../src/prompts.js";
@@ -67,13 +67,17 @@ Opções longas:
   --prompt <texto>          Instrução extra
   --tone <tom>              Tom (generate/ai-post)
   --lang <idioma>           Idioma base (padrão: pt-BR)
-  --hashtags                Permite até 2 hashtags
-  --emojis                  Permite até 2 emojis
+  --hashtags                Permite hashtags (padrão: off)
+  --emojis                  Permite emojis (padrão: off)
+  --long, -l                Orientar post longo Premium (até 25.000)
 
 Modos:
 ${modes}
 
-Por padrão: sem hashtags e sem emojis.
+Conta X (.env X_ACCOUNT_TIER=premium|free):
+${describeTier()}
+
+Por padrão: sem hashtags/emojis. Premium libera até 25k chars.
 `.trim());
 }
 
@@ -87,6 +91,7 @@ function parseArgs(argv) {
     prompt: "",
     allowHashtags: false,
     allowEmojis: false,
+    longForm: false,
   };
   const positional = [];
 
@@ -106,6 +111,8 @@ function parseArgs(argv) {
       flags.allowHashtags = true;
     } else if (arg === "--emojis") {
       flags.allowEmojis = true;
+    } else if (arg === "--long" || arg === "-l") {
+      flags.longForm = true;
     } else if (arg === "--tone") {
       flags.tone = args[++i];
     } else if (arg === "--lang") {
@@ -121,6 +128,7 @@ function parseArgs(argv) {
         else if (ch === "e") flags.modes.push("english");
         else if (ch === "s") flags.modes.push("spelling");
         else if (ch === "y") flags.yes = true;
+        else if (ch === "l") flags.longForm = true;
         else if (ch === "h") flags.help = true;
         else throw new Error(`Opção desconhecida: -${ch}`);
       }
@@ -156,6 +164,7 @@ function styleFromFlags(flags) {
     ...DEFAULT_STYLE,
     allowHashtags: Boolean(flags.allowHashtags),
     allowEmojis: Boolean(flags.allowEmojis),
+    longForm: Boolean(flags.longForm),
   };
 }
 
@@ -182,10 +191,14 @@ async function confirm(question) {
   return answer === "s" || answer === "sim" || answer === "y" || answer === "yes";
 }
 
-function printText(text, label = null) {
+function printText(text, label = null, style = DEFAULT_STYLE) {
+  const tier = getXTier();
+  const max = getMaxChars(style);
   if (label) console.log(`\n--- ${label} ---`);
   console.log(text);
-  console.log(`\n(${[...text].length}/280 caracteres — limite Free do X)`);
+  console.log(
+    `\n(${[...text].length}/${max} caracteres — X ${tier.label}${style.longForm ? " long-form" : ""})`,
+  );
 }
 
 function printCost(meta) {
@@ -271,7 +284,7 @@ async function main() {
       prompt: flags.prompt,
       style,
     });
-    printText(text, "Prévia");
+    printText(text, "Prévia", style);
     printCost(meta);
 
     if (flags.yes) {
@@ -305,7 +318,7 @@ async function main() {
       prompt: flags.prompt,
       style,
     });
-    printText(text, "Transformado");
+    printText(text, "Transformado", style);
     printCost(meta);
     return;
   }
@@ -317,7 +330,7 @@ async function main() {
     if (hasModesOrPrompt(flags)) {
       const result = await maybeTransform(openrouter, rest, flags);
       text = result.text;
-      printText(text, "Prévia");
+      printText(text, "Prévia", style);
       printCost(result.meta);
       if (!flags.yes) {
         const ok = await confirm("Publicar este texto?");
@@ -345,7 +358,7 @@ async function main() {
       style,
     });
 
-    printText(text, "Prévia");
+    printText(text, "Prévia", style);
     printCost(meta);
 
     if (!flags.yes) {

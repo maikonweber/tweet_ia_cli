@@ -2,7 +2,7 @@ import { chromium } from "playwright";
 import { existsSync, mkdirSync, unlinkSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { loadBrowserConfig, PROJECT_ROOT } from "./config.js";
-import { assertWithinFreeLimit } from "./limits.js";
+import { assertWithinLimit } from "./limits.js";
 
 const AUTH_DIR = resolve(PROJECT_ROOT, ".auth");
 const SESSION_PATH = resolve(AUTH_DIR, "x-session.json");
@@ -334,7 +334,7 @@ export async function postTweet(text) {
   if (!text || !text.trim()) {
     throw new Error("Texto do tweet vazio.");
   }
-  assertWithinFreeLimit(text.trim());
+  assertWithinLimit(text.trim());
   if (!hasSession()) {
     throw new Error("Sem sessão. Rode antes: tweet login");
   }
