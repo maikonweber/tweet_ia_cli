@@ -73,6 +73,13 @@ async function newContext(browser, withSession) {
   await context.addInitScript(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => undefined });
   });
+  try {
+    await context.grantPermissions(["clipboard-read", "clipboard-write"], {
+      origin: "https://x.com",
+    });
+  } catch {
+    // ignore
+  }
   return context;
 }
 
@@ -240,38 +247,122 @@ async function openComposer(page) {
   await dismissBlockingLayers(page);
 }
 
-async function fillComposer(page, text) {
-  await focusComposer(page);
-
-  await page.keyboard.press("Control+A");
-  await page.keyboard.press("Backspace");
-  await sleep(150);
-
-  const inserted = await page.evaluate((value) => {
+async function readComposerText(page) {
+  return page.evaluate(() => {
     const dialog = document.querySelector('[role="dialog"]');
     const el =
       (dialog && dialog.querySelector('[data-testid="tweetTextarea_0"]')) ||
-      [...document.querySelectorAll('[data-testid="tweetTextarea_0"]')].at(-1) ||
-      document.querySelector('[role="textbox"][contenteditable="true"]');
-    if (!el) return false;
-    el.focus();
-    const ok = document.execCommand("insertText", false, value);
-    el.dispatchEvent(new InputEvent("input", { bubbles: true, data: value, inputType: "insertText" }));
-    return ok || (el.innerText || "").includes(value.slice(0, Math.min(12, value.length)));
-  }, text);
+      [...document.querySelectorAll('[data-testid="tweetTextarea_0"]')].at(-1);
+    if (!el) return "";
+    return (el.innerText || el.textContent || "").replace(/\n$/, "");
+  });
+}
 
-  if (!inserted) {
-    await page.keyboard.type(text, { delay: 12 });
+async function clearComposer(page) {
+  await focusComposer(page);
+  await page.keyboard.press("Control+A");
+  await sleep(80);
+  await page.keyboard.press("Backspace");
+  await sleep(120);
+  await page.keyboard.press("Control+A");
+  await page.keyboard.press("Delete");
+  await sleep(150);
+}
+
+/**
+ * Longer posts Premium quebram com execCommand/insertText parcial.
+ * Ordem: clipboard paste → keyboard.insertText → type por blocos.
+ */
+async function fillComposer(page, text) {
+  const expected = text.trim();
+  const expectedLen = [...expected].length;
+
+  await clearComposer(page);
+
+  let ok = false;
+
+  // 1) Colar (melhor para multilinha / 25k)
+  try {
+    await page.context().grantPermissions(["clipboard-read", "clipboard-write"], {
+      origin: "https://x.com",
+    });
+  } catch {
+    // ignore
   }
 
-  await sleep(400);
+  try {
+    const pasted = await page.evaluate(async (value) => {
+      try {
+        await navigator.clipboard.writeText(value);
+        return true;
+      } catch {
+        return false;
+      }
+    }, expected);
+
+    if (pasted) {
+      await page.keyboard.press("Control+V");
+      await sleep(600);
+      const got = await readComposerText(page);
+      if ([...got].length >= Math.floor(expectedLen * 0.9)) {
+        ok = true;
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  // 2) Playwright insertText (um evento de input com o texto inteiro)
+  if (!ok) {
+    await clearComposer(page);
+    await page.keyboard.insertText(expected);
+    await sleep(500);
+    const got = await readComposerText(page);
+    if ([...got].length >= Math.floor(expectedLen * 0.9)) {
+      ok = true;
+    }
+  }
+
+  // 3) Digitar por parágrafos (Shift+Enter entre blocos no Draft.js)
+  if (!ok) {
+    await clearComposer(page);
+    const blocks = expected.split(/\n+/);
+    for (let i = 0; i < blocks.length; i++) {
+      if (blocks[i]) {
+        await page.keyboard.insertText(blocks[i]);
+      }
+      if (i < blocks.length - 1) {
+        await page.keyboard.down("Shift");
+        await page.keyboard.press("Enter");
+        await page.keyboard.up("Shift");
+        await sleep(40);
+      }
+    }
+    await sleep(400);
+    const got = await readComposerText(page);
+    if ([...got].length >= Math.floor(expectedLen * 0.9)) {
+      ok = true;
+    }
+  }
+
+  const finalText = await readComposerText(page);
+  const finalLen = [...finalText].length;
+  if (!ok || finalLen < Math.floor(expectedLen * 0.85)) {
+    throw new Error(
+      `Falha ao preencher o composer: foram ${finalLen}/${expectedLen} caracteres. ` +
+        "Tente de novo com X_HEADLESS=false para inspecionar.",
+    );
+  }
+
+  console.error(`Composer OK: ${finalLen}/${expectedLen} caracteres.`);
+  await sleep(300);
 }
 
 async function clickPost(page) {
   const btn = postButtonLocator(page);
   await btn.waitFor({ state: "visible", timeout: 30_000 });
 
-  for (let i = 0; i < 20; i++) {
+  for (let i = 0; i < 24; i++) {
     const enabled = await btn
       .evaluate((el) => {
         const node = el.closest("button") || el;
@@ -283,6 +374,9 @@ async function clickPost(page) {
   }
 
   await dismissBlockingLayers(page);
+  // Garante foco no composer cheio antes de enviar
+  await composerLocator(page).click({ force: true, timeout: 5_000 }).catch(() => {});
+  await sleep(200);
 
   try {
     await btn.click({ timeout: 8_000 });
@@ -290,9 +384,16 @@ async function clickPost(page) {
     await btn.click({ force: true, timeout: 8_000 });
   }
 
-  await sleep(500);
-  await page.keyboard.press("Control+Enter").catch(() => {});
-  await sleep(1000);
+  // Só Ctrl+Enter se o modal ainda estiver aberto (envio pode ter falhado)
+  await sleep(1200);
+  const dialogStillOpen = await page
+    .locator(`${SELECTORS.dialog} ${SELECTORS.composer}`)
+    .isVisible()
+    .catch(() => false);
+  if (dialogStillOpen) {
+    await page.keyboard.press("Control+Enter").catch(() => {});
+    await sleep(1500);
+  }
 }
 
 export async function loginX() {
